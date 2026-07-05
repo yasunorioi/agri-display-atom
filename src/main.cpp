@@ -4,10 +4,12 @@
 //   1. HDMI output    — draw a test pattern on the 1280x720 screen
 //   2. WiFi           — provision via WiFiManager captive portal (no creds in code)
 //   3. MQTT subscribe  — connect to the agriha broker, subscribe agriha/#
-//   4. live view       — dump every received topic/payload to the HDMI screen + Serial
+//   4. live view       — show every received topic/payload on the HDMI screen + Serial
 //
-// This is NOT the final EVA/NERV renderer — it is the plumbing test. Once this
-// shows live agriha data on the monitor, we build the themed dashboard on top.
+// Rendering: draw into a full-screen off-screen canvas in PSRAM, then pushSprite()
+// once per frame (double-buffered = no flicker). MQTT receipt only appends to a ring
+// buffer; the screen is redrawn on a fixed cadence so a burst of retained messages
+// can never outrun the drawing.
 
 #include <M5AtomDisplay.h>
 #include <WiFi.h>
@@ -15,26 +17,30 @@
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 
-// ---- display ----------------------------------------------------------------
+// ---- display / off-screen canvas -------------------------------------------
 M5AtomDisplay display(1280, 720);
-static int SCR_W = 1280;   // set from display.width()/height() after rotation
-static int SCR_H = 720;
+M5Canvas      canvas(&display);       // full-screen PSRAM back-buffer
+LovyanGFX*    g        = &display;    // draw target (canvas if allocated, else direct)
+bool          useCanvas = false;
+static int    SCR_W = 1280;
+static int    SCR_H = 720;
 
-// NERV-ish palette (bring-up only)
 static uint32_t C_BG, C_ORANGE, C_ORANGE_HI, C_AMBER, C_TEXT, C_DIM, C_OK, C_CRIT;
+
+static void present() { if (useCanvas) canvas.pushSprite(0, 0); }
 
 // ---- network ----------------------------------------------------------------
 WiFiClient   net;
 PubSubClient mqtt(net);
 
-static char     mqttHost[48] = "pi4.local";   // editable in the WiFi portal
+static char     mqttHost[48] = "pi4.local";
 static uint16_t mqttPort     = 1883;
 static const char* MDNS_NAME = "agri-display-01";
 
 // ---- on-screen log ring -----------------------------------------------------
-static constexpr int LOG_MAX = 26;
-static String logLines[LOG_MAX];
-static int    logCount = 0;
+static constexpr int LOG_MAX = 28;
+static String   logLines[LOG_MAX];
+static int      logCount = 0;
 static uint32_t msgTotal = 0;
 
 static void logPush(const String& s) {
@@ -46,52 +52,45 @@ static void logPush(const String& s) {
   }
 }
 
-// ---- drawing ----------------------------------------------------------------
+// ---- drawing (all into `g`) -------------------------------------------------
 static void drawHeader(const char* status, uint32_t statusColor) {
-  // color bar accent strip
-  display.fillRect(0, 0, SCR_W, 52, C_BG);
-  display.fillRect(0, 0, 8, 52, C_ORANGE);
-
-  display.setTextDatum(textdatum_t::top_left);
-  display.setTextColor(C_TEXT, C_BG);
-  display.setTextSize(3);
-  display.drawString("AGRIHA DISPLAY // BRING-UP", 24, 8);
-  display.setTextSize(2);
-  display.setTextColor(C_ORANGE_HI, C_BG);
-  display.drawString("M5Stack Atom Display  1280x720 HDMI", 24, 34);
-
-  // status pill on the right
-  display.setTextDatum(textdatum_t::top_right);
-  display.setTextColor(statusColor, C_BG);
-  display.setTextSize(2);
-  display.drawString(status, SCR_W - 24, 18);
-
-  display.drawFastHLine(0, 52, SCR_W, C_ORANGE);
+  g->fillRect(0, 0, SCR_W, 52, C_BG);
+  g->fillRect(0, 0, 8, 52, C_ORANGE);
+  g->setTextDatum(textdatum_t::top_left);
+  g->setTextColor(C_TEXT, C_BG);
+  g->setTextSize(3);
+  g->drawString("AGRIHA DISPLAY // BRING-UP", 24, 8);
+  g->setTextSize(2);
+  g->setTextColor(C_ORANGE_HI, C_BG);
+  g->drawString("M5Stack Atom Display  1280x720 HDMI", 24, 34);
+  g->setTextDatum(textdatum_t::top_right);
+  g->setTextColor(statusColor, C_BG);
+  g->setTextSize(2);
+  g->drawString(status, SCR_W - 24, 18);
+  g->drawFastHLine(0, 52, SCR_W, C_ORANGE);
 }
 
 static void drawTestPattern() {
-  display.fillScreen(C_BG);
-  // 8 vertical color bars (SMPTE-ish) so we can confirm the panel + colours
+  g->fillScreen(C_BG);
   uint32_t bars[8] = {
-    display.color888(255, 255, 255), display.color888(235, 102, 8),
-    display.color888(245, 166, 35),  display.color888(79, 194, 122),
-    display.color888(60, 140, 220),  display.color888(200, 60, 60),
-    display.color888(120, 120, 120), display.color888(30, 30, 30)
+    g->color888(255, 255, 255), g->color888(235, 102, 8),
+    g->color888(245, 166, 35),  g->color888(79, 194, 122),
+    g->color888(60, 140, 220),  g->color888(200, 60, 60),
+    g->color888(120, 120, 120), g->color888(30, 30, 30)
   };
   int bw = SCR_W / 8;
-  for (int i = 0; i < 8; i++) display.fillRect(i * bw, 60, bw, 90, bars[i]);
-
-  display.setTextDatum(textdatum_t::top_left);
-  display.setTextColor(C_TEXT, C_BG);
-  display.setTextSize(6);
-  display.drawString("AGRIHA DISPLAY", 40, 190);
-  display.setTextSize(3);
-  display.setTextColor(C_ORANGE_HI, C_BG);
-  display.drawString("HDMI OK - 1280x720", 40, 260);
-  display.setTextSize(2);
-  display.setTextColor(C_DIM, C_BG);
-  display.drawString("bring-up firmware / stage 1: display", 40, 300);
-  display.drawString("next: WiFi provisioning ...", 40, 328);
+  for (int i = 0; i < 8; i++) g->fillRect(i * bw, 60, bw, 90, bars[i]);
+  g->setTextDatum(textdatum_t::top_left);
+  g->setTextColor(C_TEXT, C_BG);
+  g->setTextSize(6);
+  g->drawString("AGRIHA DISPLAY", 40, 190);
+  g->setTextSize(3);
+  g->setTextColor(C_ORANGE_HI, C_BG);
+  g->drawString("HDMI OK - 1280x720", 40, 260);
+  g->setTextSize(2);
+  g->setTextColor(C_DIM, C_BG);
+  g->drawString("bring-up firmware / stage 1: display", 40, 300);
+  present();
 }
 
 static void drawLive() {
@@ -101,30 +100,29 @@ static void drawLive() {
            (unsigned long)msgTotal);
   drawHeader(st, up ? C_OK : C_AMBER);
 
-  // sub-line: broker + wifi
-  display.fillRect(0, 53, SCR_W, 30, C_BG);
-  display.setTextDatum(textdatum_t::top_left);
-  display.setTextColor(C_DIM, C_BG);
-  display.setTextSize(2);
-  char sub[96];
+  g->fillRect(0, 53, SCR_W, 30, C_BG);
+  g->setTextDatum(textdatum_t::top_left);
+  g->setTextColor(C_DIM, C_BG);
+  g->setTextSize(2);
+  char sub[110];
   snprintf(sub, sizeof(sub), "broker %s:%u   wifi %s   ip %s   sub agriha/#",
            mqttHost, mqttPort, WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-  display.drawString(sub, 24, 58);
-  display.drawFastHLine(0, 84, SCR_W, C_ORANGE);
+  g->drawString(sub, 24, 58);
+  g->drawFastHLine(0, 84, SCR_W, C_ORANGE);
 
-  // log body
-  display.fillRect(0, 86, SCR_W, SCR_H - 86, C_BG);
-  display.setTextSize(2);
-  int y = 92, lh = 24;
+  g->fillRect(0, 86, SCR_W, SCR_H - 86, C_BG);
+  g->setTextSize(2);
+  int y = 92, lh = 22;
   for (int i = 0; i < logCount; i++) {
-    display.setTextColor(C_TEXT, C_BG);
-    display.drawString(logLines[i], 24, y);
+    g->setTextColor(C_TEXT, C_BG);
+    g->drawString(logLines[i], 24, y);
     y += lh;
   }
   if (logCount == 0) {
-    display.setTextColor(C_DIM, C_BG);
-    display.drawString("waiting for retained agriha data ...", 24, 92);
+    g->setTextColor(C_DIM, C_BG);
+    g->drawString("waiting for retained agriha data ...", 24, 92);
   }
+  present();
 }
 
 // ---- MQTT -------------------------------------------------------------------
@@ -133,16 +131,12 @@ static void onMqtt(char* topic, byte* payload, unsigned int len) {
   p.reserve(len);
   for (unsigned int i = 0; i < len && i < 80; i++) p += (char)payload[i];
   msgTotal++;
-
   String line = String(topic) + "  =  " + p;
-  if (line.length() > 92) line = line.substring(0, 92);
-  logPush(line);
-
+  if (line.length() > 96) line = line.substring(0, 96);
+  logPush(line);                       // append only; drawing happens in loop()
   Serial.printf("[MQTT] %s = %s\n", topic, p.c_str());
-  drawLive();
 }
 
-// resolve "*.local" via mDNS; otherwise let PubSubClient take the string.
 static void mqttConnect() {
   IPAddress ip;
   bool haveIp = false;
@@ -169,25 +163,25 @@ static void mqttConnect() {
   } else {
     Serial.printf("[MQTT] connect failed rc=%d\n", mqtt.state());
   }
-  drawLive();
 }
 
 // ---- WiFiManager portal -----------------------------------------------------
 static void onPortal(WiFiManager* wm) {
-  display.fillScreen(C_BG);
+  g->fillScreen(C_BG);
   drawHeader("SETUP MODE", C_AMBER);
-  display.setTextDatum(textdatum_t::top_left);
-  display.setTextColor(C_ORANGE_HI, C_BG);
-  display.setTextSize(4);
-  display.drawString("WiFi SETUP REQUIRED", 40, 120);
-  display.setTextColor(C_TEXT, C_BG);
-  display.setTextSize(3);
-  display.drawString("1) Join WiFi AP:  agri-display-setup", 40, 200);
-  display.drawString("2) Open 192.168.4.1 in a browser", 40, 250);
-  display.drawString("3) Pick your network + MQTT broker", 40, 300);
-  display.setTextColor(C_DIM, C_BG);
-  display.setTextSize(2);
-  display.drawString("(default broker: pi4.local)", 40, 360);
+  g->setTextDatum(textdatum_t::top_left);
+  g->setTextColor(C_ORANGE_HI, C_BG);
+  g->setTextSize(4);
+  g->drawString("WiFi SETUP REQUIRED", 40, 120);
+  g->setTextColor(C_TEXT, C_BG);
+  g->setTextSize(3);
+  g->drawString("1) Join WiFi AP:  agri-display-setup", 40, 200);
+  g->drawString("2) Open 192.168.4.1 in a browser", 40, 250);
+  g->drawString("3) Pick your network + MQTT broker", 40, 300);
+  g->setTextColor(C_DIM, C_BG);
+  g->setTextSize(2);
+  g->drawString("(default broker: pi4.local)", 40, 360);
+  present();
 }
 
 void setup() {
@@ -202,6 +196,13 @@ void setup() {
   SCR_H = display.height();
   Serial.printf("[disp] W=%d H=%d\n", SCR_W, SCR_H);
 
+  // full-screen back-buffer in PSRAM (1280x720x16 = 1.84 MB)
+  canvas.setPsram(true);
+  canvas.setColorDepth(16);
+  useCanvas = canvas.createSprite(SCR_W, SCR_H);
+  g = useCanvas ? (LovyanGFX*)&canvas : (LovyanGFX*)&display;
+  Serial.printf("[disp] back-buffer %s\n", useCanvas ? "PSRAM sprite OK" : "FAILED -> direct draw");
+
   C_BG        = display.color888(10, 8, 6);
   C_ORANGE    = display.color888(235, 102, 8);
   C_ORANGE_HI = display.color888(255, 122, 20);
@@ -214,17 +215,11 @@ void setup() {
   drawTestPattern();
   delay(1200);
 
-  // ---- WiFi via captive portal (creds not stored in firmware) ----
   WiFiManager wm;
   WiFiManagerParameter p_host("host", "MQTT broker (host or IP)", mqttHost, sizeof(mqttHost));
   wm.addParameter(&p_host);
   wm.setConfigPortalTimeout(240);
   wm.setAPCallback(onPortal);
-
-  display.setTextDatum(textdatum_t::top_left);
-  display.setTextColor(C_AMBER, C_BG);
-  display.setTextSize(2);
-  display.drawString("connecting WiFi ...", 40, 356);
 
   if (!wm.autoConnect("agri-display-setup")) {
     Serial.println("[wifi] portal timeout, restarting");
@@ -235,12 +230,8 @@ void setup() {
 
   Serial.printf("[wifi] connected %s  ip=%s\n",
                 WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-
-  if (MDNS.begin(MDNS_NAME)) {
-    Serial.printf("[mDNS] responder up: %s.local\n", MDNS_NAME);
-  }
-
-  configTime(9 * 3600, 0, "pool.ntp.org");   // JST for the eventual clock
+  if (MDNS.begin(MDNS_NAME)) Serial.printf("[mDNS] responder up: %s.local\n", MDNS_NAME);
+  configTime(9 * 3600, 0, "pool.ntp.org");
 
   logPush(String("[sys] wifi ") + WiFi.SSID() + " ip " + WiFi.localIP().toString());
   drawLive();
@@ -249,21 +240,17 @@ void setup() {
 
 void loop() {
   static uint32_t lastReconnect = 0;
-  static uint32_t lastTick = 0;
+  static uint32_t lastDraw = 0;
 
   if (!mqtt.connected()) {
-    uint32_t now = millis();
-    if (now - lastReconnect > 3000) {
-      lastReconnect = now;
-      mqttConnect();
-    }
+    if (millis() - lastReconnect > 3000) { lastReconnect = millis(); mqttConnect(); }
   } else {
     mqtt.loop();
   }
 
-  // periodic redraw (refresh status/clock even without new messages)
-  if (millis() - lastTick > 1000) {
-    lastTick = millis();
+  // redraw at a fixed 5 Hz, decoupled from message rate
+  if (millis() - lastDraw > 200) {
+    lastDraw = millis();
     drawLive();
   }
 }
