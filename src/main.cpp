@@ -42,6 +42,7 @@ static constexpr int LOG_MAX = 28;
 static String   logLines[LOG_MAX];
 static int      logCount = 0;
 static uint32_t msgTotal = 0;
+static volatile bool dirty = true;    // set on new data; redraw only when set
 
 static void logPush(const String& s) {
   if (logCount < LOG_MAX) {
@@ -94,6 +95,7 @@ static void drawTestPattern() {
 }
 
 static void drawLive() {
+  uint32_t t0 = micros();
   bool up = mqtt.connected();
   char st[64];
   snprintf(st, sizeof(st), up ? "MQTT ONLINE  rx=%lu" : "MQTT ...",
@@ -122,7 +124,15 @@ static void drawLive() {
     g->setTextColor(C_DIM, C_BG);
     g->drawString("waiting for retained agriha data ...", 24, 92);
   }
+  uint32_t t1 = micros();
   present();
+  uint32_t t2 = micros();
+  static uint32_t lastLog = 0;
+  if (millis() - lastLog > 1500) {
+    lastLog = millis();
+    Serial.printf("[frame] draw=%lu us  push=%lu us  (rx=%lu)\n",
+                  (unsigned long)(t1 - t0), (unsigned long)(t2 - t1), (unsigned long)msgTotal);
+  }
 }
 
 // ---- MQTT -------------------------------------------------------------------
@@ -134,6 +144,7 @@ static void onMqtt(char* topic, byte* payload, unsigned int len) {
   String line = String(topic) + "  =  " + p;
   if (line.length() > 96) line = line.substring(0, 96);
   logPush(line);                       // append only; drawing happens in loop()
+  dirty = true;
   Serial.printf("[MQTT] %s = %s\n", topic, p.c_str());
 }
 
@@ -196,12 +207,14 @@ void setup() {
   SCR_H = display.height();
   Serial.printf("[disp] W=%d H=%d\n", SCR_W, SCR_H);
 
-  // full-screen back-buffer in PSRAM (1280x720x16 = 1.84 MB)
-  canvas.setPsram(true);
-  canvas.setColorDepth(16);
-  useCanvas = canvas.createSprite(SCR_W, SCR_H);
-  g = useCanvas ? (LovyanGFX*)&canvas : (LovyanGFX*)&display;
-  Serial.printf("[disp] back-buffer %s\n", useCanvas ? "PSRAM sprite OK" : "FAILED -> direct draw");
+  // Draw DIRECTLY to the panel. The M5AtomDisplay's framebuffer lives in the
+  // FPGA, so direct fills/text are fast (~2 ms/frame). A full-screen PSRAM
+  // back-buffer is a trap here: drawing into 1.84 MB of PSRAM (~150 ms) plus
+  // pushSprite to the FPGA (~205 ms) is ~150x slower and blocks the loop.
+  // Flicker is avoided by only repainting changed regions (never fillScreen in
+  // the live view). Small per-widget sprites can still be used later if needed.
+  useCanvas = false;
+  g = &display;
 
   C_BG        = display.color888(10, 8, 6);
   C_ORANGE    = display.color888(235, 102, 8);
@@ -248,9 +261,13 @@ void loop() {
     mqtt.loop();
   }
 
-  // redraw at a fixed 5 Hz, decoupled from message rate
-  if (millis() - lastDraw > 200) {
-    lastDraw = millis();
+  // redraw only when data changed (throttled to 5 Hz), plus a 1 Hz heartbeat
+  // for the clock/status. After the retained burst settles this drops to the
+  // sensor update rate, so the CPU isn't redrawing a static screen.
+  uint32_t now = millis();
+  if ((dirty && now - lastDraw > 200) || now - lastDraw > 1000) {
+    lastDraw = now;
+    dirty = false;
     drawLive();
   }
 }
