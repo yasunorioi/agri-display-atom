@@ -216,6 +216,25 @@ static void drawHero() {
   sprHero.pushSprite(HERO_X, HERO_Y);
 }
 
+// thermal colormap: cold(blue) -> hot(red), ~12..36 C. Skin-independent.
+static uint32_t tempColor(float t) {
+  if (isnan(t)) return C_DIM;
+  static const int N = 5;
+  static const float   ST[N] = {  12,  20,  26,  30,  36 };
+  static const uint8_t RR[N] = {  50,  40,  95, 238, 228 };
+  static const uint8_t GG[N] = { 110, 175, 195, 175,  55 };
+  static const uint8_t BB[N] = { 230, 205, 110,  45,  42 };
+  if (t <= ST[0])   return display.color888(RR[0], GG[0], BB[0]);
+  if (t >= ST[N-1]) return display.color888(RR[N-1], GG[N-1], BB[N-1]);
+  for (int i = 1; i < N; i++) if (t <= ST[i]) {
+    float f = (t - ST[i-1]) / (ST[i] - ST[i-1]);
+    return display.color888(RR[i-1] + f*(RR[i]-RR[i-1]),
+                            GG[i-1] + f*(GG[i]-GG[i-1]),
+                            BB[i-1] + f*(BB[i]-BB[i-1]));
+  }
+  return display.color888(RR[N-1], GG[N-1], BB[N-1]);
+}
+
 // ---- trend: room-temp 60 min ------------------------------------------------
 static void drawTrend() {
   sprTrend.fillSprite(C_BG);
@@ -258,13 +277,14 @@ static void drawTrend() {
   sprTrend.drawString("SP", px + 2, spy + 2);
 
   int base = py + ph;
-  for (int i = 1; i < trendCount; i++) {
+  for (int i = 1; i < trendCount; i++) {                       // thermal area fill (blue=cold..red=hot)
     int x0 = X(i - 1), x1 = X(i), y0 = Y(trendBuf[i - 1]), y1 = Y(trendBuf[i]);
-    sprTrend.fillTriangle(x0, y0, x1, y1, x0, base, C_AREA);
-    sprTrend.fillTriangle(x1, y1, x1, base, x0, base, C_AREA);
+    uint32_t col = tempColor((trendBuf[i - 1] + trendBuf[i]) * 0.5f);
+    sprTrend.fillTriangle(x0, y0, x1, y1, x0, base, col);
+    sprTrend.fillTriangle(x1, y1, x1, base, x0, base, col);
   }
-  for (int i = 1; i < trendCount; i++)
-    sprTrend.drawLine(X(i - 1), Y(trendBuf[i - 1]), X(i), Y(trendBuf[i]), C_ACCENT_HI);
+  for (int i = 1; i < trendCount; i++)                          // crisp top edge
+    sprTrend.drawLine(X(i - 1), Y(trendBuf[i - 1]), X(i), Y(trendBuf[i]), C_TEXT);
   int ex = X(trendCount - 1), ey = Y(trendBuf[trendCount - 1]);
   sprTrend.fillCircle(ex, ey, 3, C_AMBER);
   sprTrend.pushSprite(TR_X, TR_Y);
