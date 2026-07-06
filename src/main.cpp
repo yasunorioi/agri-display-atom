@@ -102,7 +102,7 @@ static float    trendBuf[TR_N];
 static int      trendCount = 0;
 static bool     trendDirty = true;
 
-static float TH_CAUTION = 26.8f, TH_ALERT = 27.6f, TH_DANGER = 28.6f, TEMP_SP = 26.0f;
+static float TH_CAUTION = 29.0f, TH_ALERT = 30.0f, TH_DANGER = 31.0f, TEMP_SP = 28.0f;
 static uint32_t sevColor(float t) {
   if (isnan(t)) return C_DIM;
   if (t >= TH_DANGER)  return C_CRIT;
@@ -142,6 +142,22 @@ static void fmt(char* b, size_t n, float v, int dec) {
   snprintf(b, n, dec ? "%.1f" : "%.0f", v);
 }
 
+// ---- freeze/heartbeat indicator (small hexagon, toggles white<->red) --------
+static bool g_beat = false;
+static void drawHex(int cx, int cy, int r, uint32_t fill, uint32_t outline) {
+  static const float HX[6] = { 0.f, 0.866f, 0.866f, 0.f, -0.866f, -0.866f };
+  static const float HY[6] = { -1.f, -0.5f, 0.5f, 1.f, 0.5f, -0.5f };
+  int vx[6], vy[6];
+  for (int i = 0; i < 6; i++) { vx[i] = cx + (int)roundf(r * HX[i]); vy[i] = cy + (int)roundf(r * HY[i]); }
+  for (int i = 0; i < 6; i++) display.fillTriangle(cx, cy, vx[i], vy[i], vx[(i + 1) % 6], vy[(i + 1) % 6], fill);
+  for (int i = 0; i < 6; i++) display.drawLine(vx[i], vy[i], vx[(i + 1) % 6], vy[(i + 1) % 6], outline);
+}
+static void drawHeartbeat() {
+  int cx = SCR_W - MX - 18, cy = 31, r = 9;
+  display.fillRect(cx - r - 2, cy - r - 2, 2 * r + 4, 2 * r + 4, C_PANEL);   // clear over header
+  drawHex(cx, cy, r, g_beat ? display.color888(255, 255, 255) : display.color888(235, 45, 45), C_DIM);
+}
+
 // ---- header (accent + status shift with severity) ---------------------------
 static void drawHeader() {
   display.fillRect(MX, 6, SCR_W - 2 * MX, HDR_H - 6, C_PANEL);
@@ -157,8 +173,9 @@ static void drawHeader() {
   display.setFont(&fonts::lgfxJapanGothic_24);
   display.setTextDatum(textdatum_t::middle_right);
   display.setTextColor(g_sev == SEV_NORMAL ? C_DIM : sevMain());
-  display.drawString(sevMsg(), SCR_W - MX - 10, 33);
+  display.drawString(sevMsg(), SCR_W - MX - 40, 33);        // leave room for heartbeat hex
   display.drawFastHLine(MX, HDR_H + 2, SCR_W - 2 * MX, headerCol());
+  drawHeartbeat();
 }
 static void drawChrome() { display.fillScreen(C_BG); drawHeader(); }
 
@@ -388,10 +405,10 @@ static void loadConfig() {
   prefs.begin("agridisp", true);
   g_skin     = prefs.getInt("skin", 0);
   g_house    = prefs.getInt("house", 2);
-  TH_CAUTION = prefs.getFloat("thc", 26.8f);
-  TH_ALERT   = prefs.getFloat("tha", 27.6f);
-  TH_DANGER  = prefs.getFloat("thd", 28.6f);
-  TEMP_SP    = prefs.getFloat("sp", 26.0f);
+  TH_CAUTION = prefs.getFloat("thc", 29.0f);
+  TH_ALERT   = prefs.getFloat("tha", 30.0f);
+  TH_DANGER  = prefs.getFloat("thd", 31.0f);
+  TEMP_SP    = prefs.getFloat("sp", 28.0f);
   prefs.end();
   if (g_skin < 0 || g_skin > 2) g_skin = 0;
 }
@@ -522,8 +539,11 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastReconnect = 0, lastDraw = 0, lastSample = 0;
+  static uint32_t lastReconnect = 0, lastDraw = 0, lastSample = 0, lastBeat = 0;
   server.handleClient();
+  // heartbeat: toggle the header hexagon on a steady interval; if the loop
+  // ever hangs, it stops toggling and you can tell the display is frozen.
+  if (millis() - lastBeat > 500) { lastBeat = millis(); g_beat = !g_beat; drawHeartbeat(); }
   if (!mqtt.connected()) {
     if (millis() - lastReconnect > 3000) { lastReconnect = millis(); mqttConnect(); }
   } else {
