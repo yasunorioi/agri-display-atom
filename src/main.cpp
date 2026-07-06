@@ -40,19 +40,19 @@ WebServer   server(80);
 Preferences prefs;
 static int  g_skin  = 0;     // 0=eva  1=consumer  2=corp
 static int  g_house = 2;     // which agriha house to display
-static const char* SKIN_NAME[3] = { "EVA / NERV", "一般向け", "JTC 無難" };
+static const char* SKIN_NAME[3] = { "EVA / NERV", "一般 1 (クール)", "一般 2 (ウォーム)" };
 
 // apply a skin's palette into the C_* tokens (whole UI is drawn through these)
 static void applySkin(int idx) {
   auto c = [](uint8_t r, uint8_t g, uint8_t b){ return display.color888(r, g, b); };
-  if (idx == 1) {          // consumer — light, friendly green
+  if (idx == 1) {          // 一般1 — light, cool fresh green
     C_BG=c(244,246,243); C_PANEL=c(255,255,255); C_LINE=c(198,208,202); C_GRID=c(226,232,228);
     C_AREA=c(170,216,188); C_ACCENT=c(47,163,107); C_ACCENT_HI=c(55,192,127); C_AMBER=c(228,145,43);
     C_TEXT=c(28,43,36); C_DIM=c(96,114,103); C_OK=c(47,163,107); C_WARN=c(228,145,43); C_CRIT=c(219,74,61);
-  } else if (idx == 2) {   // corp — light, corporate blue
-    C_BG=c(234,238,243); C_PANEL=c(255,255,255); C_LINE=c(200,210,220); C_GRID=c(222,230,238);
-    C_AREA=c(168,198,226); C_ACCENT=c(18,111,184); C_ACCENT_HI=c(47,137,207); C_AMBER=c(217,139,18);
-    C_TEXT=c(34,48,60); C_DIM=c(91,107,120); C_OK=c(46,139,87); C_WARN=c(217,139,18); C_CRIT=c(196,61,61);
+  } else if (idx == 2) {   // 一般2 — light, warm cream + friendly orange
+    C_BG=c(250,246,238); C_PANEL=c(255,255,255); C_LINE=c(224,212,194); C_GRID=c(238,230,218);
+    C_AREA=c(246,206,158); C_ACCENT=c(228,126,52); C_ACCENT_HI=c(240,150,80); C_AMBER=c(224,150,40);
+    C_TEXT=c(58,46,34); C_DIM=c(146,124,100); C_OK=c(90,170,110); C_WARN=c(224,150,40); C_CRIT=c(212,84,60);
   } else {                 // eva — dark, NERV orange (default)
     C_BG=c(10,8,6); C_PANEL=c(22,16,10); C_LINE=c(96,54,18); C_GRID=c(44,26,10);
     C_AREA=c(140,76,18); C_ACCENT=c(235,102,8); C_ACCENT_HI=c(255,122,20); C_AMBER=c(245,166,35);
