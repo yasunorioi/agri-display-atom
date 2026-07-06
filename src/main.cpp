@@ -1,15 +1,14 @@
 // agri-display-atom — EVA/NERV dashboard
 //
 // Rendering model that fits the Atom Display (framebuffer lives in the FPGA):
-//   - draw the header/background ONCE
-//   - every panel is a self-contained widget: it owns its rect (bg + border +
-//     content), rendered into a small PSRAM sprite and pushed to just that rect
-//     only when its data changes. Small sprite = fast push + flicker-free.
-//     (A full-screen PSRAM back-buffer is ~350 ms/frame here — avoided.)
+//   - header/background drawn once
+//   - every panel is a self-contained widget rendered into a small PSRAM sprite
+//     and pushed to just its rect, only when its data changes. Small sprite =
+//     fast push + flicker-free. (A full-screen PSRAM back-buffer is ~350 ms.)
 //
-// Layout (1280x720): room-temp hero ring (left) | 60-min temp trend (center
-// top) + CO2/HD tiles (center bottom) | humidity/pressure/current/flow tiles
-// (right column) | east/west window aperture bars (bottom).
+// TV-safe: all content lives inside a MARGIN inset from every edge, because
+// consumer TVs (e.g. REGZA) overscan a 720p signal and crop/​wrap the outer
+// ~5%. On a no-overscan monitor this just shows a thin black border.
 
 #include <M5AtomDisplay.h>
 #include <WiFi.h>
@@ -20,25 +19,38 @@
 
 // ---- display / sprites ------------------------------------------------------
 M5AtomDisplay display(1280, 720);
-M5Canvas sprHero(&display);    // 360x540
-M5Canvas sprTrend(&display);   // 556x250
-M5Canvas sprBig(&display);     // 272x278  (CO2 / HD, reused)
-M5Canvas sprSm(&display);      // 308x128  (humid/pres/cur/flow, reused)
-M5Canvas sprWin(&display);     // 616x92   (window bar, reused)
+M5Canvas sprHero(&display);    // 340x524
+M5Canvas sprTrend(&display);   // 520x240
+M5Canvas sprBig(&display);     // 254x272  (CO2 / HD, reused)
+M5Canvas sprSm(&display);      // 308x120  (humid/pres/cur/flow, reused)
+M5Canvas sprWin(&display);     // 596x88   (window bar, reused)
 static int SCR_W = 1280, SCR_H = 720;
 
 static uint32_t C_BG, C_PANEL, C_LINE, C_GRID, C_AREA, C_ACCENT, C_ACCENT_HI,
                 C_AMBER, C_TEXT, C_DIM, C_OK, C_WARN, C_CRIT;
 
-// ---- layout -----------------------------------------------------------------
-#define HERO_X 16
-#define HERO_Y 64
-#define HERO_W 360
-#define HERO_H 540
-#define TR_X 388
-#define TR_Y 64
-#define TR_W 556
-#define TR_H 250
+// ---- layout (all inside a 40 px TV-safe margin) -----------------------------
+#define MX      40
+#define HDR_H   58
+#define HERO_X  MX
+#define HERO_Y  66
+#define HERO_W  340
+#define HERO_H  524
+#define TR_X    396
+#define TR_Y    66
+#define TR_W    520
+#define TR_H    240
+#define BT_Y    320
+#define BT_W    254
+#define BT_H    272
+#define CO2_X   396
+#define HD_X    662
+#define RC_X    932
+#define RC_W    308
+#define RC_H    120
+#define WIN_Y   604
+#define WIN_W   596
+#define WIN_H   88
 
 // ---- network ----------------------------------------------------------------
 WiFiClient   net;
@@ -82,24 +94,24 @@ static void fmt(char* b, size_t n, float v, int dec) {
 // ---- chrome (drawn once) ----------------------------------------------------
 static void drawChrome() {
   display.fillScreen(C_BG);
-  display.fillRect(0, 0, SCR_W, 54, C_PANEL);
-  display.fillRect(0, 0, 8, 54, C_ACCENT);
+  display.fillRect(MX, 6, SCR_W - 2 * MX, HDR_H - 6, C_PANEL);
+  display.fillRect(MX, 6, 8, HDR_H - 6, C_ACCENT);
   display.setFont(&fonts::lgfxJapanGothic_28);
   display.setTextDatum(textdatum_t::middle_left);
   display.setTextColor(C_TEXT);
-  display.drawString("AGRIHA 統合環境管制", 24, 27);
+  display.drawString("AGRIHA 統合環境管制", MX + 22, 33);
   display.setFont(&fonts::Font2);
   display.setTextColor(C_ACCENT_HI);
-  display.drawString("HOUSE 02 / BEPPO-UNIT", 372, 28);
-  display.drawFastHLine(0, 54, SCR_W, C_ACCENT);
+  display.drawString("HOUSE 02 / BEPPO-UNIT", 400, 34);
+  display.drawFastHLine(MX, HDR_H + 2, SCR_W - 2 * MX, C_ACCENT);
 }
 
 // ---- hero: room-temp ring ---------------------------------------------------
 static void drawHero() {
   sprHero.fillSprite(C_BG);
   sprHero.drawRect(0, 0, HERO_W, HERO_H, C_LINE);
-  int cx = HERO_W / 2, cy = 216, rO = 150, rI = 128;
-  sprHero.fillArc(cx, cy, rO, rI, 135, 45, C_LINE);           // 270 deg track, gap at bottom
+  int cx = HERO_W / 2, cy = 196, rO = 140, rI = 118;
+  sprHero.fillArc(cx, cy, rO, rI, 135, 45, C_LINE);          // 270 deg track, gap at bottom
   float t = g_temp.v;
   if (!isnan(t)) {
     float frac = (t - 15.0f) / 20.0f; frac = frac < 0 ? 0 : (frac > 1 ? 1 : frac);
@@ -112,24 +124,23 @@ static void drawHero() {
   sprHero.drawString(buf, cx, cy - 4);
   sprHero.setFont(&fonts::lgfxJapanGothic_24);
   sprHero.setTextColor(C_DIM);
-  sprHero.drawString("室温 / IN-AIR TEMP ℃", cx, cy + 76);
+  sprHero.drawString("室温 / IN-AIR TEMP ℃", cx, cy + 72);
   char sp[40]; snprintf(sp, sizeof(sp), "SP %.1f℃   range 15-35", TEMP_SP);
   sprHero.setFont(&fonts::lgfxJapanGothic_16);
   sprHero.setTextColor(C_DIM);
   sprHero.setTextDatum(textdatum_t::top_center);
-  sprHero.drawString(sp, cx, cy + 108);
-  // node/status footer
-  sprHero.drawFastHLine(16, HERO_H - 88, HERO_W - 32, C_LINE);
+  sprHero.drawString(sp, cx, cy + 104);
+  // footer: unit id + status
+  sprHero.drawFastHLine(16, HERO_H - 84, HERO_W - 32, C_LINE);
   sprHero.setFont(&fonts::lgfxJapanGothic_16);
   sprHero.setTextDatum(textdatum_t::top_left);
   sprHero.setTextColor(C_DIM);
-  sprHero.drawString("HOUSE 02  別棟", 20, HERO_H - 78);
+  sprHero.drawString("HOUSE 02  別棟", 20, HERO_H - 74);
   const char* st = "正常"; uint32_t sc = C_OK;
   if (!isnan(t)) { if (t >= TH_DANGER){st="危険";sc=C_CRIT;} else if(t>=TH_ALERT){st="警告";sc=C_ACCENT_HI;} else if(t>=TH_CAUTION){st="注意";sc=C_WARN;} }
   sprHero.setFont(&fonts::lgfxJapanGothic_28);
   sprHero.setTextColor(sc);
-  sprHero.setTextDatum(textdatum_t::top_left);
-  sprHero.drawString(st, 20, HERO_H - 52);
+  sprHero.drawString(st, 20, HERO_H - 50);
   sprHero.pushSprite(HERO_X, HERO_Y);
 }
 
@@ -159,7 +170,7 @@ static void drawTrend() {
   auto Y = [&](float v){ return py + ph - (int)((v - lo) / (hi - lo) * ph); };
   auto X = [&](int i){ return trendCount == 1 ? px : px + (int)((float)i / (trendCount - 1) * pw); };
 
-  for (int d = (int)ceilf(lo); d <= (int)hi; d++) {              // grid + axis labels
+  for (int d = (int)ceilf(lo); d <= (int)hi; d++) {
     int yy = Y(d);
     sprTrend.drawFastHLine(px, yy, pw, C_GRID);
     sprTrend.setFont(&fonts::Font2);
@@ -167,7 +178,7 @@ static void drawTrend() {
     sprTrend.setTextDatum(textdatum_t::middle_right);
     sprTrend.drawString(String(d), px - 4, yy);
   }
-  int spy = Y(TEMP_SP);                                          // setpoint (dashed)
+  int spy = Y(TEMP_SP);
   for (int x = px; x < px + pw; x += 8) sprTrend.drawFastHLine(x, spy, 4, C_AMBER);
   sprTrend.setFont(&fonts::Font2);
   sprTrend.setTextColor(C_AMBER);
@@ -175,14 +186,14 @@ static void drawTrend() {
   sprTrend.drawString("SP", px + 2, spy + 2);
 
   int base = py + ph;
-  for (int i = 1; i < trendCount; i++) {                          // area fill
+  for (int i = 1; i < trendCount; i++) {
     int x0 = X(i - 1), x1 = X(i), y0 = Y(trendBuf[i - 1]), y1 = Y(trendBuf[i]);
     sprTrend.fillTriangle(x0, y0, x1, y1, x0, base, C_AREA);
     sprTrend.fillTriangle(x1, y1, x1, base, x0, base, C_AREA);
   }
-  for (int i = 1; i < trendCount; i++)                            // line
+  for (int i = 1; i < trendCount; i++)
     sprTrend.drawLine(X(i - 1), Y(trendBuf[i - 1]), X(i), Y(trendBuf[i]), C_ACCENT_HI);
-  int ex = X(trendCount - 1), ey = Y(trendBuf[trendCount - 1]);   // endpoint
+  int ex = X(trendCount - 1), ey = Y(trendBuf[trendCount - 1]);
   sprTrend.fillCircle(ex, ey, 3, C_AMBER);
   sprTrend.pushSprite(TR_X, TR_Y);
 }
@@ -204,7 +215,7 @@ static void drawTileInto(M5Canvas& spr, int x, int y, int w, int h,
   if (valSize > 1) {                          // big tile: centered so 3-4 digits always fit
     spr.setTextDatum(textdatum_t::middle_center);
     spr.drawString(buf, w / 2, h / 2 + 24);
-  } else {                                    // small tile: right-aligned, unit to the right
+  } else {                                    // small tile: right-aligned
     spr.setTextDatum(textdatum_t::bottom_right);
     spr.drawString(buf, w - 92, h - 12);
   }
@@ -218,16 +229,14 @@ static void drawTileInto(M5Canvas& spr, int x, int y, int w, int h,
 
 // ---- window aperture bar ----------------------------------------------------
 static void drawWindow(int idx, Win& w) {
-  const int W = 616, H = 92;
-  int x = (idx == 0) ? 16 : 648;
-  int y = 616;
+  int x = (idx == 0) ? MX : 644;
   sprWin.fillSprite(C_BG);
-  sprWin.drawRect(0, 0, W, H, C_LINE);
+  sprWin.drawRect(0, 0, WIN_W, WIN_H, C_LINE);
   sprWin.setFont(&fonts::lgfxJapanGothic_24);
   sprWin.setTextColor(C_ACCENT);
   sprWin.setTextDatum(textdatum_t::middle_left);
-  sprWin.drawString(idx == 0 ? "東窓" : "西窓", 14, 30);
-  int tx = 110, tw = W - 230, th = 26, ty = 16;
+  sprWin.drawString(idx == 0 ? "東窓" : "西窓", 14, 28);
+  int tx = 100, tw = WIN_W - 210, th = 24, ty = 14;
   sprWin.drawRect(tx, ty, tw, th, C_LINE);
   int fw = (int)(tw * (w.pct / 100.0f));
   if (fw > 2) sprWin.fillRect(tx + 1, ty + 1, fw - 2, th - 2, C_ACCENT);
@@ -237,24 +246,24 @@ static void drawWindow(int idx, Win& w) {
   sprWin.setFont(&fonts::Font4);
   sprWin.setTextColor(C_TEXT);
   sprWin.setTextDatum(textdatum_t::middle_right);
-  sprWin.drawString(pc, W - 14, 30);
+  sprWin.drawString(pc, WIN_W - 14, 28);
   sprWin.setFont(&fonts::Font2);
   sprWin.setTextColor(C_DIM);
   sprWin.setTextDatum(textdatum_t::top_left);
   char sub[48]; snprintf(sub, sizeof(sub), "target %d%%   src %s", w.target, w.src);
-  sprWin.drawString(sub, 110, 56);
-  sprWin.pushSprite(x, y);
+  sprWin.drawString(sub, 100, 52);
+  sprWin.pushSprite(x, WIN_Y);
 }
 
 static void redrawDirty() {
   if (g_temp.dirty)  { drawHero();  g_temp.dirty = false; }
   if (trendDirty)    { drawTrend(); trendDirty = false; }
-  if (g_co2.dirty)   { drawTileInto(sprBig, 388, 326, 272, 278, "CO2",  g_co2.v,  0, "ppm",   2); g_co2.dirty = false; }
-  if (g_hd.dirty)    { drawTileInto(sprBig, 672, 326, 272, 278, "飽差", g_hd.v,  1, "g/m³", 2); g_hd.dirty = false; }
-  if (g_humid.dirty) { drawTileInto(sprSm, 956,  64, 308, 128, "湿度", g_humid.v, 0, "%RH",  1); g_humid.dirty = false; }
-  if (g_pres.dirty)  { drawTileInto(sprSm, 956, 204, 308, 128, "気圧", g_pres.v,  0, "hPa",  1); g_pres.dirty = false; }
-  if (g_cur.dirty)   { drawTileInto(sprSm, 956, 344, 308, 128, "電流", g_cur.v,   1, "A",    1); g_cur.dirty = false; }
-  if (g_flow.dirty)  { drawTileInto(sprSm, 956, 484, 308, 128, "灌水", g_flow.v,  1, "L/min",1); g_flow.dirty = false; }
+  if (g_co2.dirty)   { drawTileInto(sprBig, CO2_X, BT_Y, BT_W, BT_H, "CO2",  g_co2.v,  0, "ppm",   2); g_co2.dirty = false; }
+  if (g_hd.dirty)    { drawTileInto(sprBig, HD_X,  BT_Y, BT_W, BT_H, "飽差", g_hd.v,  1, "g/m³", 2); g_hd.dirty = false; }
+  if (g_humid.dirty) { drawTileInto(sprSm, RC_X, 66,  RC_W, RC_H, "湿度", g_humid.v, 0, "%RH",  1); g_humid.dirty = false; }
+  if (g_pres.dirty)  { drawTileInto(sprSm, RC_X, 194, RC_W, RC_H, "気圧", g_pres.v,  0, "hPa",  1); g_pres.dirty = false; }
+  if (g_cur.dirty)   { drawTileInto(sprSm, RC_X, 322, RC_W, RC_H, "電流", g_cur.v,   1, "A",    1); g_cur.dirty = false; }
+  if (g_flow.dirty)  { drawTileInto(sprSm, RC_X, 450, RC_W, RC_H, "灌水", g_flow.v,  1, "L/min",1); g_flow.dirty = false; }
   if (g_win1.dirty)  { drawWindow(0, g_win1); g_win1.dirty = false; }
   if (g_win2.dirty)  { drawWindow(1, g_win2); g_win2.dirty = false; }
 }
@@ -299,18 +308,18 @@ static void mqttConnect() {
 
 static void onPortal(WiFiManager* wm) {
   display.fillScreen(C_BG);
-  display.fillRect(0, 0, SCR_W, 54, C_PANEL);
-  display.fillRect(0, 0, 8, 54, C_ACCENT);
+  display.fillRect(MX, 6, SCR_W - 2 * MX, HDR_H - 6, C_PANEL);
+  display.fillRect(MX, 6, 8, HDR_H - 6, C_ACCENT);
   display.setFont(&fonts::lgfxJapanGothic_28);
   display.setTextColor(C_AMBER);
   display.setTextDatum(textdatum_t::middle_left);
-  display.drawString("WiFi SETUP", 24, 27);
+  display.drawString("WiFi SETUP", MX + 22, 33);
   display.setFont(&fonts::lgfxJapanGothic_24);
   display.setTextColor(C_TEXT);
   display.setTextDatum(textdatum_t::top_left);
-  display.drawString("1) WiFi AP に接続:  agri-display-setup", 40, 140);
-  display.drawString("2) ブラウザで 192.168.4.1", 40, 200);
-  display.drawString("3) ネットワークと MQTT broker を選択", 40, 260);
+  display.drawString("1) WiFi AP に接続:  agri-display-setup", MX + 20, 150);
+  display.drawString("2) ブラウザで 192.168.4.1", MX + 20, 210);
+  display.drawString("3) ネットワークと MQTT broker を選択", MX + 20, 270);
 }
 
 void setup() {
@@ -330,7 +339,7 @@ void setup() {
   C_PANEL     = display.color888(22, 16, 10);
   C_LINE      = display.color888(96, 54, 18);
   C_GRID      = display.color888(44, 26, 10);
-  C_AREA      = display.color888(120, 56, 14);
+  C_AREA      = display.color888(140, 76, 18);
   C_ACCENT    = display.color888(235, 102, 8);
   C_ACCENT_HI = display.color888(255, 122, 20);
   C_AMBER     = display.color888(245, 166, 35);
@@ -342,9 +351,9 @@ void setup() {
 
   sprHero.setPsram(true);  sprHero.setColorDepth(16);  sprHero.createSprite(HERO_W, HERO_H);
   sprTrend.setPsram(true); sprTrend.setColorDepth(16); sprTrend.createSprite(TR_W, TR_H);
-  sprBig.setPsram(true);   sprBig.setColorDepth(16);   sprBig.createSprite(272, 278);
-  sprSm.setPsram(true);    sprSm.setColorDepth(16);    sprSm.createSprite(308, 128);
-  sprWin.setPsram(true);   sprWin.setColorDepth(16);   sprWin.createSprite(616, 92);
+  sprBig.setPsram(true);   sprBig.setColorDepth(16);   sprBig.createSprite(BT_W, BT_H);
+  sprSm.setPsram(true);    sprSm.setColorDepth(16);    sprSm.createSprite(RC_W, RC_H);
+  sprWin.setPsram(true);   sprWin.setColorDepth(16);   sprWin.createSprite(WIN_W, WIN_H);
 
   drawChrome();
 
@@ -372,7 +381,6 @@ void loop() {
   } else {
     mqtt.loop();
   }
-  // sample room temp into the trend: first sample ~2 s after boot, then 40 s
   uint32_t now = millis();
   if (!isnan(g_temp.v) && (lastSample == 0 ? now > 2000 : now - lastSample > 40000)) {
     lastSample = now; trendPush(g_temp.v);
