@@ -85,17 +85,36 @@ static void trendPush(float v) {
   trendDirty = true;
 }
 
+// ---- whole-screen severity (driven by room temp) ----------------------------
+enum Sev { SEV_NORMAL, SEV_CAUTION, SEV_ALERT, SEV_DANGER };
+static Sev g_sev = SEV_NORMAL;
+static Sev computeSev(float t) {
+  if (isnan(t)) return SEV_NORMAL;
+  if (t >= TH_DANGER)  return SEV_DANGER;
+  if (t >= TH_ALERT)   return SEV_ALERT;
+  if (t >= TH_CAUTION) return SEV_CAUTION;
+  return SEV_NORMAL;
+}
+static uint32_t sevMain() { switch (g_sev) { case SEV_DANGER: return C_CRIT; case SEV_ALERT: return C_ACCENT_HI; case SEV_CAUTION: return C_WARN; default: return C_OK; } }
+static uint32_t borderCol() { switch (g_sev) { case SEV_DANGER: return C_CRIT; case SEV_ALERT: return C_ACCENT; case SEV_CAUTION: return C_AMBER; default: return C_LINE; } }
+static uint32_t headerCol() { switch (g_sev) { case SEV_DANGER: return C_CRIT; case SEV_ALERT: return C_ACCENT_HI; case SEV_CAUTION: return C_AMBER; default: return C_ACCENT; } }
+static const char* sevWord() { switch (g_sev) { case SEV_DANGER: return "危険"; case SEV_ALERT: return "警告"; case SEV_CAUTION: return "注意"; default: return "正常"; } }
+static const char* sevMsg()  { switch (g_sev) { case SEV_DANGER: return "危険 — 室温 危険域 緊急換気"; case SEV_ALERT: return "警告 — 室温 上限超過 換気要求"; case SEV_CAUTION: return "注意 — 室温 上昇中"; default: return "SYSTEM NOMINAL"; } }
+static void markAllDirty() {
+  g_temp.dirty = g_humid.dirty = g_co2.dirty = g_hd.dirty = g_pres.dirty = g_cur.dirty = g_flow.dirty = true;
+  trendDirty = true; g_win1.dirty = g_win2.dirty = true;
+}
+
 // ---- helpers ----------------------------------------------------------------
 static void fmt(char* b, size_t n, float v, int dec) {
   if (isnan(v)) { snprintf(b, n, dec ? "--.-" : "---"); return; }
   snprintf(b, n, dec ? "%.1f" : "%.0f", v);
 }
 
-// ---- chrome (drawn once) ----------------------------------------------------
-static void drawChrome() {
-  display.fillScreen(C_BG);
+// ---- header (accent + status shift with severity) ---------------------------
+static void drawHeader() {
   display.fillRect(MX, 6, SCR_W - 2 * MX, HDR_H - 6, C_PANEL);
-  display.fillRect(MX, 6, 8, HDR_H - 6, C_ACCENT);
+  display.fillRect(MX, 6, 8, HDR_H - 6, headerCol());
   display.setFont(&fonts::lgfxJapanGothic_28);
   display.setTextDatum(textdatum_t::middle_left);
   display.setTextColor(C_TEXT);
@@ -103,13 +122,18 @@ static void drawChrome() {
   display.setFont(&fonts::Font2);
   display.setTextColor(C_ACCENT_HI);
   display.drawString("HOUSE 02 / BEPPO-UNIT", 400, 34);
-  display.drawFastHLine(MX, HDR_H + 2, SCR_W - 2 * MX, C_ACCENT);
+  display.setFont(&fonts::lgfxJapanGothic_24);
+  display.setTextDatum(textdatum_t::middle_right);
+  display.setTextColor(g_sev == SEV_NORMAL ? C_DIM : sevMain());
+  display.drawString(sevMsg(), SCR_W - MX - 10, 33);
+  display.drawFastHLine(MX, HDR_H + 2, SCR_W - 2 * MX, headerCol());
 }
+static void drawChrome() { display.fillScreen(C_BG); drawHeader(); }
 
 // ---- hero: room-temp ring ---------------------------------------------------
 static void drawHero() {
   sprHero.fillSprite(C_BG);
-  sprHero.drawRect(0, 0, HERO_W, HERO_H, C_LINE);
+  sprHero.drawRect(0, 0, HERO_W, HERO_H, borderCol());
   int cx = HERO_W / 2, cy = 196, rO = 140, rI = 118;
   sprHero.fillArc(cx, cy, rO, rI, 135, 45, C_LINE);          // 270 deg track, gap at bottom
   float t = g_temp.v;
@@ -136,18 +160,16 @@ static void drawHero() {
   sprHero.setTextDatum(textdatum_t::top_left);
   sprHero.setTextColor(C_DIM);
   sprHero.drawString("HOUSE 02  別棟", 20, HERO_H - 74);
-  const char* st = "正常"; uint32_t sc = C_OK;
-  if (!isnan(t)) { if (t >= TH_DANGER){st="危険";sc=C_CRIT;} else if(t>=TH_ALERT){st="警告";sc=C_ACCENT_HI;} else if(t>=TH_CAUTION){st="注意";sc=C_WARN;} }
   sprHero.setFont(&fonts::lgfxJapanGothic_28);
-  sprHero.setTextColor(sc);
-  sprHero.drawString(st, 20, HERO_H - 50);
+  sprHero.setTextColor(sevMain());
+  sprHero.drawString(sevWord(), 20, HERO_H - 50);
   sprHero.pushSprite(HERO_X, HERO_Y);
 }
 
 // ---- trend: room-temp 60 min ------------------------------------------------
 static void drawTrend() {
   sprTrend.fillSprite(C_BG);
-  sprTrend.drawRect(0, 0, TR_W, TR_H, C_LINE);
+  sprTrend.drawRect(0, 0, TR_W, TR_H, borderCol());
   sprTrend.setFont(&fonts::lgfxJapanGothic_20);
   sprTrend.setTextColor(C_ACCENT);
   sprTrend.setTextDatum(textdatum_t::top_left);
@@ -203,7 +225,7 @@ static void drawTileInto(M5Canvas& spr, int x, int y, int w, int h,
                          const char* label, float val, int dec, const char* unit,
                          int valSize) {
   spr.fillSprite(C_BG);
-  spr.drawRect(0, 0, w, h, C_LINE);
+  spr.drawRect(0, 0, w, h, borderCol());
   spr.setFont(&fonts::lgfxJapanGothic_28);
   spr.setTextColor(C_ACCENT);
   spr.setTextDatum(textdatum_t::top_left);
@@ -231,7 +253,7 @@ static void drawTileInto(M5Canvas& spr, int x, int y, int w, int h,
 static void drawWindow(int idx, Win& w) {
   int x = (idx == 0) ? MX : 644;
   sprWin.fillSprite(C_BG);
-  sprWin.drawRect(0, 0, WIN_W, WIN_H, C_LINE);
+  sprWin.drawRect(0, 0, WIN_W, WIN_H, borderCol());
   sprWin.setFont(&fonts::lgfxJapanGothic_24);
   sprWin.setTextColor(C_ACCENT);
   sprWin.setTextDatum(textdatum_t::middle_left);
@@ -256,7 +278,11 @@ static void drawWindow(int idx, Win& w) {
 }
 
 static void redrawDirty() {
-  if (g_temp.dirty)  { drawHero();  g_temp.dirty = false; }
+  if (g_temp.dirty) {
+    Sev ns = computeSev(g_temp.v);
+    if (ns != g_sev) { g_sev = ns; drawHeader(); markAllDirty(); }  // whole-screen recolor
+    drawHero(); g_temp.dirty = false;
+  }
   if (trendDirty)    { drawTrend(); trendDirty = false; }
   if (g_co2.dirty)   { drawTileInto(sprBig, CO2_X, BT_Y, BT_W, BT_H, "CO2",  g_co2.v,  0, "ppm",   2); g_co2.dirty = false; }
   if (g_hd.dirty)    { drawTileInto(sprBig, HD_X,  BT_Y, BT_W, BT_H, "飽差", g_hd.v,  1, "g/m³", 2); g_hd.dirty = false; }
