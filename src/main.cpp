@@ -17,9 +17,32 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <Update.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 
 #define FW_NAME    "agri-display-atom"
-#define FW_VERSION "0.2.0"
+#define FW_VERSION "0.3.0"
+
+// ---- GitHub-release self-update (semi-automatic) ----------------------------
+// WiFi node, so agri-node-poe-core/AgriOTA.h (W5500/ETH) can't be reused — this
+// is a self-contained port with the same policy: check the latest release tag at
+// boot and once a day, raise an on-screen banner + WebUI button when a newer
+// version exists, and only flash on user click (POST /api/update). Requires a
+// GitHub Release tagged vX.Y.Z carrying an asset named exactly OTA_BIN.
+#define OTA_REPO "yasunorioi/agri-display-atom"
+#define OTA_BIN  "agri-display-atom.bin"
+enum OtaState { OTA_IDLE, OTA_PENDING, OTA_RUNNING, OTA_DONE, OTA_FAILED };
+static volatile OtaState g_otaState = OTA_IDLE;
+static char     g_otaLatest[16] = "";
+static bool     g_otaAvail = false;
+static int      g_otaProg  = 0;
+static char     g_otaErr[40] = "";
+static uint32_t g_otaLastCheck = 0;
+static const uint32_t OTA_RECHECK_MS = 24UL * 60 * 60 * 1000;
+static const char* otaStateStr() {
+  switch (g_otaState) { case OTA_PENDING: return "pending"; case OTA_RUNNING: return "running";
+    case OTA_DONE: return "done"; case OTA_FAILED: return "failed"; default: return "idle"; }
+}
 
 // ---- display / sprites ------------------------------------------------------
 M5AtomDisplay display(1280, 720);
@@ -196,8 +219,14 @@ static void drawHeader() {
   display.drawString(hs, 400, 34);
   display.setFont(&fonts::lgfxJapanGothic_24);
   display.setTextDatum(textdatum_t::middle_right);
-  display.setTextColor(g_sev == SEV_NORMAL ? C_DIM : sevMain());
-  display.drawString(sevMsg(), SCR_W - MX - 40, 33);
+  char st[56]; uint32_t stc;
+  if      (g_otaState == OTA_RUNNING) { snprintf(st, sizeof(st), "更新中 %d%%", g_otaProg);      stc = C_AMBER; }
+  else if (g_otaState == OTA_PENDING) { snprintf(st, sizeof(st), "更新準備中…");                 stc = C_AMBER; }
+  else if (g_otaState == OTA_FAILED)  { snprintf(st, sizeof(st), "更新失敗");                     stc = C_CRIT;  }
+  else if (g_otaAvail)                { snprintf(st, sizeof(st), "新FW v%s あり WebUIで更新", g_otaLatest); stc = C_ACCENT_HI; }
+  else                                { strlcpy(st, sevMsg(), sizeof(st)); stc = g_sev == SEV_NORMAL ? C_DIM : sevMain(); }
+  display.setTextColor(stc);
+  display.drawString(st, SCR_W - MX - 40, 33);
   display.drawFastHLine(MX, HDR_H + 2, SCR_W - 2 * MX, headerCol());
   drawHeartbeat();
 }
@@ -419,6 +448,79 @@ static void mqttConnect() {
   else Serial.printf("[MQTT] connect failed rc=%d\n", mqtt.state());
 }
 
+// ---- self-update: check + flash ---------------------------------------------
+static bool otaSemverNewer(const char* a, const char* b) {
+  int ai[3] = {0,0,0}, bi[3] = {0,0,0};
+  sscanf(a, "%d.%d.%d", &ai[0], &ai[1], &ai[2]);
+  sscanf(b, "%d.%d.%d", &bi[0], &bi[1], &bi[2]);
+  for (int i = 0; i < 3; i++) { if (ai[i] > bi[i]) return true; if (ai[i] < bi[i]) return false; }
+  return false;
+}
+static String otaJsonStr(const String& body, const char* key) {
+  String needle = String("\"") + key + "\":\"";
+  int p = body.indexOf(needle); if (p < 0) return "";
+  p += needle.length(); int e = body.indexOf('"', p);
+  return (e <= p) ? String("") : body.substring(p, e);
+}
+static void otaCheckLatest() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  g_otaLastCheck = millis();               // stamp up-front: a failed check waits a full interval
+  WiFiClientSecure c; c.setInsecure();
+  HTTPClient http; http.setTimeout(6000);
+  String url = String("https://api.github.com/repos/") + OTA_REPO + "/releases/latest";
+  if (!http.begin(c, url)) return;
+  http.addHeader("User-Agent", "agri-display-atom");
+  int code = http.GET();
+  bool wasAvail = g_otaAvail;
+  if (code == 200) {
+    String tag = otaJsonStr(http.getString(), "tag_name");
+    if (tag.length()) {
+      String ver = (tag[0] == 'v' || tag[0] == 'V') ? tag.substring(1) : tag;
+      strlcpy(g_otaLatest, ver.c_str(), sizeof(g_otaLatest));
+      g_otaAvail = otaSemverNewer(g_otaLatest, FW_VERSION);
+      Serial.printf("[OTA] latest=%s cur=%s avail=%d\n", g_otaLatest, FW_VERSION, g_otaAvail);
+    }
+  } else Serial.printf("[OTA] check HTTP %d\n", code);
+  http.end();
+  if (g_otaAvail != wasAvail) drawHeader();  // surface / clear the on-screen banner
+}
+static void otaRun() {
+  if (!g_otaLatest[0]) { strlcpy(g_otaErr, "no version", sizeof(g_otaErr)); g_otaState = OTA_FAILED; return; }
+  g_otaState = OTA_RUNNING; g_otaProg = 0; g_otaErr[0] = 0; drawHeader();
+  String url = String("https://github.com/") + OTA_REPO + "/releases/download/v" + g_otaLatest + "/" + OTA_BIN;
+  Serial.printf("[OTA] GET %s\n", url.c_str());
+  WiFiClientSecure c; c.setInsecure();
+  HTTPClient http; http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(c, url)) { strlcpy(g_otaErr, "begin failed", sizeof(g_otaErr)); g_otaState = OTA_FAILED; drawHeader(); return; }
+  http.addHeader("User-Agent", "agri-display-atom-OTA");
+  int code = http.GET();
+  if (code != 200) { snprintf(g_otaErr, sizeof(g_otaErr), "HTTP %d", code); g_otaState = OTA_FAILED; http.end(); drawHeader(); return; }
+  int total = http.getSize();
+  if (total <= 0 || !Update.begin((size_t)total)) { strlcpy(g_otaErr, "begin size", sizeof(g_otaErr)); g_otaState = OTA_FAILED; http.end(); drawHeader(); return; }
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t buf[1024]; int written = 0; uint32_t lastY = millis(), lastUi = millis();
+  while (http.connected() && written < total) {
+    size_t avail = stream->available();
+    if (avail) {
+      int r = stream->readBytes(buf, avail > sizeof(buf) ? sizeof(buf) : avail);
+      if (r <= 0) break;
+      if (Update.write(buf, r) != (size_t)r) { Update.abort(); strlcpy(g_otaErr, "write", sizeof(g_otaErr)); g_otaState = OTA_FAILED; http.end(); drawHeader(); return; }
+      written += r; g_otaProg = (int)((int64_t)written * 100 / total);
+    } else delay(1);
+    if (millis() - lastY  > 50)  { yield(); lastY = millis(); }
+    if (millis() - lastUi > 400) { lastUi = millis(); drawHeader(); }   // live % on screen
+  }
+  http.end();
+  if (written != total || !Update.end(true)) { Update.abort(); strlcpy(g_otaErr, "incomplete", sizeof(g_otaErr)); g_otaState = OTA_FAILED; drawHeader(); return; }
+  g_otaState = OTA_DONE; Serial.println("[OTA] done, restarting"); delay(500); ESP.restart();
+}
+static void otaPoll() {                     // loop hook: run when scheduled, else daily re-check
+  if (g_otaState == OTA_PENDING) { otaRun(); return; }
+  if (g_otaState == OTA_RUNNING) return;
+  if ((uint32_t)(millis() - g_otaLastCheck) >= OTA_RECHECK_MS) otaCheckLatest();
+}
+
 // ---- config persistence -----------------------------------------------------
 static void loadConfig() {
   prefs.begin("agridisp", true);
@@ -479,8 +581,18 @@ static String htmlPage() {
   s += F("</div><div class=row>");
   snprintf(b,sizeof(b),"<div><label>警告</label><input name=tha value=%.1f></div>",TH_ALERT); s+=b;
   snprintf(b,sizeof(b),"<div><label>危険</label><input name=thd value=%.1f></div>",TH_DANGER); s+=b;
-  s += F("</div><button type=submit>保存</button></form>"
-    "<h2>ファーム更新 (OTA)</h2><form method=post action=/api/ota enctype=multipart/form-data>"
+  s += F("</div><button type=submit>保存</button></form>");
+  // GitHub self-update banner (shown only when a newer release exists / is in flight)
+  if (g_otaAvail || g_otaState != OTA_IDLE) {
+    s += F("<h2>自動更新 (GitHub)</h2>");
+    if (g_otaState == OTA_RUNNING)      { snprintf(b, sizeof(b), "<p class=v>更新中 %d%% …</p>", g_otaProg); s += b; }
+    else if (g_otaState == OTA_FAILED)  { s += F("<p>更新失敗: "); s += g_otaErr; s += F("</p>"); }
+    else if (g_otaAvail) {
+      snprintf(b, sizeof(b), "<p>新しいバージョン <b>v%s</b> が利用可能（現在 v%s）</p>", g_otaLatest, FW_VERSION); s += b;
+      s += F("<form method=post action=/api/update><button type=submit>今すぐ更新</button></form>");
+    }
+  }
+  s += F("<h2>ファーム更新 (手動 OTA)</h2><form method=post action=/api/ota enctype=multipart/form-data>"
     "<input type=file name=firmware accept=.bin><button type=submit>アップロードして更新</button></form>");
   return s;
 }
@@ -493,7 +605,17 @@ static void handleStatus() {
   if (!isnan(hh.temp))  d["temp"]  = hh.temp;
   if (!isnan(hh.humid)) d["humid"] = hh.humid;
   if (!isnan(hh.co2))   d["co2"]   = hh.co2;
+  d["ota_state"] = otaStateStr();
+  d["ota_prog"]  = g_otaProg;
+  if (g_otaAvail) d["ota_latest"] = g_otaLatest;
+  if (g_otaErr[0]) d["ota_error"] = g_otaErr;
   String o; serializeJson(d, o); server.send(200, "application/json", o);
+}
+static void handleUpdate() {              // one-click apply of an available release
+  if (!g_otaAvail)                                          { server.send(409, "text/plain", "no update available"); return; }
+  if (g_otaState == OTA_RUNNING || g_otaState == OTA_PENDING) { server.send(409, "text/plain", "in progress"); return; }
+  g_otaState = OTA_PENDING;               // otaPoll() picks it up on the next loop and flashes
+  server.sendHeader("Location", "/"); server.send(303);
 }
 static void handleSave() {
   int oldSkin = g_skin;
@@ -529,6 +651,7 @@ static void startServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/update", HTTP_POST, handleUpdate);
   server.on("/api/ota", HTTP_POST, handleOtaEnd, handleOtaUpload);
   server.begin();
   Serial.println("[web] server on :80");
@@ -591,11 +714,13 @@ void setup() {
   drawChrome();
   redrawDirty();
   mqttConnect();
+  otaCheckLatest();          // boot-time release check (WiFi + NTP already up)
 }
 
 void loop() {
   static uint32_t lastReconnect = 0, lastDraw = 0, lastSample = 0, lastBeat = 0, lastRot = 0;
   server.handleClient();
+  otaPoll();                 // daily re-check + flash when a /api/update click set PENDING
   if (millis() - lastBeat > 500) { lastBeat = millis(); g_beat = !g_beat; drawHeartbeat(); }
 
   if (!mqtt.connected()) {
