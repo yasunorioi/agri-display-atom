@@ -447,7 +447,7 @@ static void saveConfig() {
 
 // ---- WebUI ------------------------------------------------------------------
 static String htmlPage() {
-  String s; s.reserve(3600); char b[96];
+  String s; s.reserve(3600); char b[128];
   s += F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>agri-display</title><style>"
     "body{background:#0d0a07;color:#f3e7d3;font-family:system-ui,sans-serif;margin:0;padding:20px;max-width:640px}"
@@ -467,8 +467,12 @@ static String htmlPage() {
   snprintf(b,sizeof(b),"<div>CO2<div class=v>%.0f ppm</div></div>",h.co2); s+=b;
   s += F("</div><form method=post action=/save><h2>表示</h2><label>スキン</label><select name=skin>");
   for (int i=0;i<3;i++){ s+="<option value="; s+=i; if(i==g_skin)s+=F(" selected"); s+=">"; s+=SKIN_NAME[i]; s+="</option>"; }
-  snprintf(b,sizeof(b),"</select><label>ハウス (カンマ区切り 例 1,2,3)</label><input name=houses value=\"%s\">",g_housesStr); s+=b;
-  snprintf(b,sizeof(b),"<label>切替間隔 (秒・複数棟時)</label><input name=rotsec type=number min=3 value=%d>",g_rotSecs); s+=b;
+  s += F("</select><label>ハウス (カンマ区切り 例 1,2,3)</label><input name=houses value=\"");
+  s += g_housesStr;
+  s += F("\">");
+  s += F("<label>切替間隔 (秒・複数棟時)</label><input name=rotsec type=number min=3 value=\"");
+  s += g_rotSecs;
+  s += F("\">");
   s += F("<h2>温度しきい値 (&deg;C)</h2><div class=row>");
   snprintf(b,sizeof(b),"<div><label>目標 SP</label><input name=sp value=%.1f></div>",TEMP_SP); s+=b;
   snprintf(b,sizeof(b),"<div><label>注意</label><input name=thc value=%.1f></div>",TH_CAUTION); s+=b;
