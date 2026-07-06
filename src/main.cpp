@@ -16,6 +16,12 @@
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <Update.h>
+
+#define FW_NAME    "agri-display-atom"
+#define FW_VERSION "0.1.0"
 
 // ---- display / sprites ------------------------------------------------------
 M5AtomDisplay display(1280, 720);
@@ -28,6 +34,31 @@ static int SCR_W = 1280, SCR_H = 720;
 
 static uint32_t C_BG, C_PANEL, C_LINE, C_GRID, C_AREA, C_ACCENT, C_ACCENT_HI,
                 C_AMBER, C_TEXT, C_DIM, C_OK, C_WARN, C_CRIT;
+
+// ---- user config (persisted in NVS, editable via WebUI) ---------------------
+WebServer   server(80);
+Preferences prefs;
+static int  g_skin  = 0;     // 0=eva  1=consumer  2=corp
+static int  g_house = 2;     // which agriha house to display
+static const char* SKIN_NAME[3] = { "EVA / NERV", "一般向け", "JTC 無難" };
+
+// apply a skin's palette into the C_* tokens (whole UI is drawn through these)
+static void applySkin(int idx) {
+  auto c = [](uint8_t r, uint8_t g, uint8_t b){ return display.color888(r, g, b); };
+  if (idx == 1) {          // consumer — light, friendly green
+    C_BG=c(244,246,243); C_PANEL=c(255,255,255); C_LINE=c(198,208,202); C_GRID=c(226,232,228);
+    C_AREA=c(170,216,188); C_ACCENT=c(47,163,107); C_ACCENT_HI=c(55,192,127); C_AMBER=c(228,145,43);
+    C_TEXT=c(28,43,36); C_DIM=c(96,114,103); C_OK=c(47,163,107); C_WARN=c(228,145,43); C_CRIT=c(219,74,61);
+  } else if (idx == 2) {   // corp — light, corporate blue
+    C_BG=c(234,238,243); C_PANEL=c(255,255,255); C_LINE=c(200,210,220); C_GRID=c(222,230,238);
+    C_AREA=c(168,198,226); C_ACCENT=c(18,111,184); C_ACCENT_HI=c(47,137,207); C_AMBER=c(217,139,18);
+    C_TEXT=c(34,48,60); C_DIM=c(91,107,120); C_OK=c(46,139,87); C_WARN=c(217,139,18); C_CRIT=c(196,61,61);
+  } else {                 // eva — dark, NERV orange (default)
+    C_BG=c(10,8,6); C_PANEL=c(22,16,10); C_LINE=c(96,54,18); C_GRID=c(44,26,10);
+    C_AREA=c(140,76,18); C_ACCENT=c(235,102,8); C_ACCENT_HI=c(255,122,20); C_AMBER=c(245,166,35);
+    C_TEXT=c(243,231,211); C_DIM=c(150,112,72); C_OK=c(79,194,122); C_WARN=c(245,166,35); C_CRIT=c(240,57,43);
+  }
+}
 
 // ---- layout (all inside a 40 px TV-safe margin) -----------------------------
 #define MX      40
@@ -121,7 +152,8 @@ static void drawHeader() {
   display.drawString("AGRIHA 統合環境管制", MX + 22, 33);
   display.setFont(&fonts::Font2);
   display.setTextColor(C_ACCENT_HI);
-  display.drawString("HOUSE 02 / BEPPO-UNIT", 400, 34);
+  char hs[24]; snprintf(hs, sizeof(hs), "HOUSE %02d", g_house);
+  display.drawString(hs, 400, 34);
   display.setFont(&fonts::lgfxJapanGothic_24);
   display.setTextDatum(textdatum_t::middle_right);
   display.setTextColor(g_sev == SEV_NORMAL ? C_DIM : sevMain());
@@ -159,7 +191,8 @@ static void drawHero() {
   sprHero.setFont(&fonts::lgfxJapanGothic_16);
   sprHero.setTextDatum(textdatum_t::top_left);
   sprHero.setTextColor(C_DIM);
-  sprHero.drawString("HOUSE 02  別棟", 20, HERO_H - 74);
+  char hs[24]; snprintf(hs, sizeof(hs), "HOUSE %02d  別棟", g_house);
+  sprHero.drawString(hs, 20, HERO_H - 74);
   sprHero.setFont(&fonts::lgfxJapanGothic_28);
   sprHero.setTextColor(sevMain());
   sprHero.drawString(sevWord(), 20, HERO_H - 50);
@@ -300,6 +333,8 @@ static bool ends(const char* topic, const char* suffix) {
   return lt >= ls && strcmp(topic + lt - ls, suffix) == 0;
 }
 static void onMqtt(char* topic, byte* payload, unsigned int len) {
+  char pfx[16]; int n = snprintf(pfx, sizeof(pfx), "agriha/%d/", g_house);
+  if (strncmp(topic, pfx, n) != 0) return;          // only the selected house
   StaticJsonDocument<384> doc;
   if (deserializeJson(doc, payload, len)) return;
   if      (ends(topic, "/sensor/InAirTemp"))     { g_temp.v  = doc["value"] | NAN; g_temp.dirty = true; }
@@ -348,10 +383,106 @@ static void onPortal(WiFiManager* wm) {
   display.drawString("3) ネットワークと MQTT broker を選択", MX + 20, 270);
 }
 
+// ---- config persistence (NVS) -----------------------------------------------
+static void loadConfig() {
+  prefs.begin("agridisp", true);
+  g_skin     = prefs.getInt("skin", 0);
+  g_house    = prefs.getInt("house", 2);
+  TH_CAUTION = prefs.getFloat("thc", 26.8f);
+  TH_ALERT   = prefs.getFloat("tha", 27.6f);
+  TH_DANGER  = prefs.getFloat("thd", 28.6f);
+  TEMP_SP    = prefs.getFloat("sp", 26.0f);
+  prefs.end();
+  if (g_skin < 0 || g_skin > 2) g_skin = 0;
+}
+static void saveConfig() {
+  prefs.begin("agridisp", false);
+  prefs.putInt("skin", g_skin);        prefs.putInt("house", g_house);
+  prefs.putFloat("thc", TH_CAUTION);   prefs.putFloat("tha", TH_ALERT);
+  prefs.putFloat("thd", TH_DANGER);    prefs.putFloat("sp", TEMP_SP);
+  prefs.end();
+}
+
+// ---- WebUI ------------------------------------------------------------------
+static String htmlPage() {
+  String s; s.reserve(3400);
+  char b[80];
+  s += F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>agri-display</title><style>"
+    "body{background:#0d0a07;color:#f3e7d3;font-family:system-ui,sans-serif;margin:0;padding:20px;max-width:640px}"
+    "h1{font-size:18px;letter-spacing:.08em;color:#ff7a14;margin:0}"
+    "h2{font-size:12px;color:#c29566;text-transform:uppercase;letter-spacing:.2em;margin:22px 0 8px;border-bottom:1px solid #4a2c10;padding-bottom:4px}"
+    "label{display:block;margin:10px 0 4px;font-size:13px;color:#c29566}"
+    "input,select{width:100%;padding:9px;background:#15100a;color:#f3e7d3;border:1px solid #4a2c10;border-radius:6px;font-size:15px;box-sizing:border-box}"
+    "button{margin-top:18px;width:100%;padding:12px;background:#eb6608;color:#0a0806;border:0;border-radius:6px;font-size:16px;font-weight:700}"
+    ".row{display:flex;gap:10px}.row>div{flex:1}.v{color:#f3e7d3;font-variant-numeric:tabular-nums;font-size:20px}small{color:#7c5c3a}</style>");
+  s += F("<h1>AGRIHA DISPLAY 設定</h1><small>");
+  s += FW_NAME; s += " v"; s += FW_VERSION; s += " · "; s += WiFi.localIP().toString(); s += F("</small>");
+  s += F("<h2>現在値</h2><div class=row>");
+  snprintf(b,sizeof(b),"<div>室温<div class=v>%.1f&deg;C</div></div>",g_temp.v); s+=b;
+  snprintf(b,sizeof(b),"<div>湿度<div class=v>%.0f%%</div></div>",g_humid.v); s+=b;
+  snprintf(b,sizeof(b),"<div>CO2<div class=v>%.0f ppm</div></div>",g_co2.v); s+=b;
+  s += F("</div><form method=post action=/save><h2>表示</h2><label>スキン</label><select name=skin>");
+  for (int i=0;i<3;i++){ s+="<option value="; s+=i; if(i==g_skin)s+=F(" selected"); s+=">"; s+=SKIN_NAME[i]; s+="</option>"; }
+  snprintf(b,sizeof(b),"</select><label>ハウス番号</label><input name=house type=number value=%d>",g_house); s+=b;
+  s += F("<h2>温度しきい値 (&deg;C)</h2><div class=row>");
+  snprintf(b,sizeof(b),"<div><label>目標 SP</label><input name=sp value=%.1f></div>",TEMP_SP); s+=b;
+  snprintf(b,sizeof(b),"<div><label>注意</label><input name=thc value=%.1f></div>",TH_CAUTION); s+=b;
+  s += F("</div><div class=row>");
+  snprintf(b,sizeof(b),"<div><label>警告</label><input name=tha value=%.1f></div>",TH_ALERT); s+=b;
+  snprintf(b,sizeof(b),"<div><label>危険</label><input name=thd value=%.1f></div>",TH_DANGER); s+=b;
+  s += F("</div><button type=submit>保存</button></form>"
+    "<h2>ファーム更新 (OTA)</h2><form method=post action=/api/ota enctype=multipart/form-data>"
+    "<input type=file name=firmware accept=.bin><button type=submit>アップロードして更新</button></form>");
+  return s;
+}
+static void handleRoot()   { server.send(200, "text/html; charset=utf-8", htmlPage()); }
+static void handleStatus() {
+  StaticJsonDocument<256> d;
+  d["fw_name"]=FW_NAME; d["fw_version"]=FW_VERSION; d["ip"]=WiFi.localIP().toString();
+  d["skin"]=g_skin; d["house"]=g_house; d["temp"]=g_temp.v; d["humid"]=g_humid.v; d["co2"]=g_co2.v;
+  String o; serializeJson(d, o); server.send(200, "application/json", o);
+}
+static void handleSave() {
+  int oldSkin = g_skin;
+  if (server.hasArg("skin"))  g_skin  = server.arg("skin").toInt();
+  if (server.hasArg("house")) g_house = server.arg("house").toInt();
+  if (server.hasArg("sp"))    TEMP_SP    = server.arg("sp").toFloat();
+  if (server.hasArg("thc"))   TH_CAUTION = server.arg("thc").toFloat();
+  if (server.hasArg("tha"))   TH_ALERT   = server.arg("tha").toFloat();
+  if (server.hasArg("thd"))   TH_DANGER  = server.arg("thd").toFloat();
+  if (g_skin < 0 || g_skin > 2) g_skin = 0;
+  saveConfig();
+  if (g_skin != oldSkin) applySkin(g_skin);
+  g_sev = computeSev(g_temp.v);
+  drawChrome(); markAllDirty();
+  server.sendHeader("Location", "/"); server.send(303);
+}
+static void handleOtaEnd() {
+  server.sendHeader("Connection", "close");
+  server.send(Update.hasError() ? 500 : 200, "text/plain", Update.hasError() ? "FAIL" : "OK — rebooting");
+  delay(400); ESP.restart();
+}
+static void handleOtaUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START)      Update.begin(UPDATE_SIZE_UNKNOWN);
+  else if (up.status == UPLOAD_FILE_WRITE) Update.write(up.buf, up.currentSize);
+  else if (up.status == UPLOAD_FILE_END)   Update.end(true);
+}
+static void startServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/ota", HTTP_POST, handleOtaEnd, handleOtaUpload);
+  server.begin();
+  Serial.println("[web] server on :80");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[boot] agri-display-atom EVA dashboard");
+  loadConfig();
 
   delay(600);                          // let the FPGA boot its flash bitstream
   display.init();
@@ -361,19 +492,7 @@ void setup() {
   SCR_W = display.width(); SCR_H = display.height();
   Serial.printf("[disp] W=%d H=%d\n", SCR_W, SCR_H);
 
-  C_BG        = display.color888(10, 8, 6);
-  C_PANEL     = display.color888(22, 16, 10);
-  C_LINE      = display.color888(96, 54, 18);
-  C_GRID      = display.color888(44, 26, 10);
-  C_AREA      = display.color888(140, 76, 18);
-  C_ACCENT    = display.color888(235, 102, 8);
-  C_ACCENT_HI = display.color888(255, 122, 20);
-  C_AMBER     = display.color888(245, 166, 35);
-  C_TEXT      = display.color888(243, 231, 211);
-  C_DIM       = display.color888(150, 112, 72);
-  C_OK        = display.color888(79, 194, 122);
-  C_WARN      = display.color888(245, 166, 35);
-  C_CRIT      = display.color888(240, 57, 43);
+  applySkin(g_skin);
 
   sprHero.setPsram(true);  sprHero.setColorDepth(16);  sprHero.createSprite(HERO_W, HERO_H);
   sprTrend.setPsram(true); sprTrend.setColorDepth(16); sprTrend.createSprite(TR_W, TR_H);
@@ -394,7 +513,9 @@ void setup() {
   Serial.printf("[wifi] %s ip=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
 
   MDNS.begin(MDNS_NAME);
+  MDNS.addService("http", "tcp", 80);
   configTime(9 * 3600, 0, "pool.ntp.org");
+  startServer();
   drawChrome();
   redrawDirty();
   mqttConnect();
@@ -402,6 +523,7 @@ void setup() {
 
 void loop() {
   static uint32_t lastReconnect = 0, lastDraw = 0, lastSample = 0;
+  server.handleClient();
   if (!mqtt.connected()) {
     if (millis() - lastReconnect > 3000) { lastReconnect = millis(); mqttConnect(); }
   } else {
