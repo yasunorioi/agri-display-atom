@@ -21,7 +21,7 @@
 #include <HTTPClient.h>
 
 #define FW_NAME    "agri-display-atom"
-#define FW_VERSION "0.3.0"
+#define FW_VERSION "0.4.0"
 
 // ---- GitHub-release self-update (semi-automatic) ----------------------------
 // WiFi node, so agri-node-poe-core/AgriOTA.h (W5500/ETH) can't be reused — this
@@ -61,6 +61,17 @@ WebServer   server(80);
 Preferences prefs;
 static int  g_skin = 0;                 // 0=eva 1=一般1 2=一般2
 static const char* SKIN_NAME[3] = { "EVA / NERV", "一般 1 (クール)", "一般 2 (ウォーム)" };
+
+// ---- window-reason warning overlay (EVA band over the hero) -----------------
+// Driven by agriha/{house}/window/reason/{winid} (ArSprout STD_ATMP status, read
+// only — see Arsprout-RESTAPI/scripts/arsprout_logic_reason_pub.py). The band is
+// composited into the PSRAM hero sprite with a real per-pixel blend. Knobs match
+// the design mock (R32vLxVvcTJC9kNFZ7sae5); user tunes them at home via the WebUI.
+static bool g_ovOn   = true;            // master enable
+static int  g_ovOp   = 45;             // 文字の濃さ  text density 0..100 (mock 0.45)
+static int  g_ovBh   = 44;             // 帯の太さ    band thickness px (mock 44)
+static int  g_ovFs   = 168;            // 文字サイズ  big-word px (mock 168)
+static int  g_ovSec  = 45;             // 出す長さ    transient open/close linger, s (mock 45)
 
 static void applySkin(int idx) {
   auto c = [](uint8_t r, uint8_t g, uint8_t b){ return display.color888(r, g, b); };
@@ -115,6 +126,15 @@ struct HouseData {
   float temp=NAN, humid=NAN, co2=NAN, hd=NAN, pres=NAN, cur=NAN, flow=NAN;
   int   w1p=0, w1t=0, w2p=0, w2t=0;
   char  w1s[10]="-", w2s[10]="-";
+  // window-reason, per side (0=east 1=west). See handleReason().
+  int      rTgt[2]   = {-1, -1};        // last reason target_pct (-1 = none yet)
+  char     rCons[2][20] = {"", ""};     // raw CONSTRAINT ("none"/"AlertAction"/…)
+  int      rCnd[2]   = {-1, -1};        // CND_NO time-of-day band
+  bool     rAlert[2] = {false, false};  // an alert flag is active (may be non-binding)
+  char     rAlertTxt[2][40] = {"", ""}; // human-readable alert condition
+  int8_t   rMotDir[2]= {0, 0};          // last open(+1)/close(-1) target move
+  uint32_t rMotMs[2] = {0, 0};          // millis of that move (for the linger timer)
+  uint32_t rTs[2]    = {0, 0};          // millis of last reason update (staleness)
 };
 static HouseData HS[HMAX];
 static bool dTemp=true, dHumid=true, dCo2=true, dHd=true, dPres=true, dCur=true, dFlow=true, dW1=true, dW2=true, dTrend=true;
@@ -232,6 +252,111 @@ static void drawHeader() {
 }
 static void drawChrome() { display.fillScreen(C_BG); drawHeader(); }
 
+// ---- warning overlay (window-reason band composited over the hero) ----------
+// Colour mixing in 24-bit space (fg over bg at a/255). The bands sit on empty
+// (C_BG) zones of the hero sprite, so a pre-blended opaque fill is pixel-identical
+// to a true alpha composite — no framebuffer read-back needed on this hardware.
+static inline uint32_t mix888(uint32_t fg, uint32_t bg, uint8_t a) {
+  uint32_t fr=(fg>>16)&0xFF, fg2=(fg>>8)&0xFF, fb=fg&0xFF;
+  uint32_t br=(bg>>16)&0xFF, bg2=(bg>>8)&0xFF, bb=bg&0xFF;
+  uint32_t r=(fr*a+br*(255-a))/255, g=(fg2*a+bg2*(255-a))/255, b=(fb*a+bb*(255-a))/255;
+  return (r<<16)|(g<<8)|b;
+}
+
+// CONSTRAINT class: 0=none, 1=alert flag (may be non-binding), 2=hard override.
+// Only "none"/"AlertAction" are confirmed so far; any other raw value is treated
+// as a hard override (red) and shown verbatim until we learn its meaning (handoff §4).
+static int consKind(const char* c) {
+  if (!c[0] || !strcmp(c, "none")) return 0;
+  if (strstr(c, "Alert")) return 1;
+  return 2;
+}
+
+enum OvSev { OV_NONE = 0, OV_INFO, OV_ALERT, OV_HARD };
+struct Overlay {
+  bool        active = false;
+  OvSev       sev    = OV_NONE;   // big-word colour + blink
+  bool        blink  = false;
+  const char* word   = "";        // 解放 / 閉鎖 / 警報
+  char        top[56] = "";       // reason line (persistent constraint/alert, else motion)
+  char        bot[40] = "";       // 目標 N%  区分 C/8
+};
+
+// Separate the active alert FLAG (top band, persistent) from what actually set the
+// opening — temperature-driven motion / hard override (big word). Handoff §4 訂正.
+static Overlay computeOverlay(int house, uint32_t now) {
+  HouseData& h = HS[house];
+  Overlay o;
+  bool hard=false, alert=false, openSeen=false, closeSeen=false;
+  const char* hardRaw=""; const char* alertTxt="";
+  int tgt=-1, cnd=-1;
+  for (int s = 0; s < 2; s++) {
+    if (h.rTgt[s] < 0) continue;                       // never reported
+    if ((uint32_t)(now - h.rTs[s]) > 45000) continue;  // stale → ignore (no frozen banner)
+    int k = consKind(h.rCons[s]);
+    if (k == 2) { hard = true; if (!hardRaw[0]) hardRaw = h.rCons[s]; }
+    if (h.rAlert[s]) { alert = true; if (!alertTxt[0]) alertTxt = h.rAlertTxt[s]; }
+    if (h.rMotDir[s] != 0 && (uint32_t)(now - h.rMotMs[s]) < (uint32_t)g_ovSec * 1000) {
+      if (h.rMotDir[s] > 0) openSeen = true; else closeSeen = true;
+    }
+    if (tgt < 0) tgt = h.rTgt[s];
+    if (cnd < 0) cnd = h.rCnd[s];
+  }
+  int8_t motion = closeSeen ? -1 : (openSeen ? 1 : 0);
+
+  if      (hard)       { o.sev = OV_HARD;  o.blink = true; o.word = "閉鎖"; }
+  else if (motion > 0) { o.sev = OV_INFO;  o.word = "解放"; }
+  else if (motion < 0) { o.sev = OV_INFO;  o.word = "閉鎖"; }
+  else if (alert)      { o.sev = OV_ALERT; o.word = "警報"; }
+
+  if      (hard)   snprintf(o.top, sizeof(o.top), "制約  %s", hardRaw);
+  else if (alert)  snprintf(o.top, sizeof(o.top), "警報  %s", alertTxt[0] ? alertTxt : "作動中");
+  else if (motion) snprintf(o.top, sizeof(o.top), "%s", motion > 0 ? "気温制御  換気ひらく" : "気温制御  しめる");
+
+  o.active = o.word[0] || o.top[0];
+  if (o.active) {
+    if (cnd >= 0) snprintf(o.bot, sizeof(o.bot), "目標 %d%%   区分 %d/8", tgt < 0 ? 0 : tgt, cnd);
+    else          snprintf(o.bot, sizeof(o.bot), "目標 %d%%", tgt < 0 ? 0 : tgt);
+  }
+  return o;
+}
+
+static void drawOverlayInto(M5Canvas& spr) {
+  if (!g_ovOn) return;
+  Overlay o = computeOverlay(g_house, millis());
+  if (!o.active) return;
+  uint32_t wc = o.sev == OV_HARD ? C_CRIT : o.sev == OV_ALERT ? C_AMBER : C_ACCENT_HI;
+  int bh = g_ovBh; if (bh < 16) bh = 16; if (bh > 90) bh = 90;
+  spr.setTextDatum(textdatum_t::middle_center);
+  // top band = reason
+  if (o.top[0]) {
+    spr.fillRect(6, 8, HERO_W - 12, bh, mix888(wc, C_BG, 104));
+    spr.drawRect(6, 8, HERO_W - 12, bh, wc);
+    spr.setFont(&fonts::lgfxJapanGothic_20);
+    spr.setTextColor(C_TEXT);
+    spr.drawString(o.top, HERO_W / 2, 8 + bh / 2);
+  }
+  // big word over the ring centre, dimmed by the 濃さ (density) knob → ghost effect
+  bool showWord = !(o.blink && !g_beat);
+  if (showWord && o.word[0]) {
+    int sz = (g_ovFs + 20) / 40; if (sz < 1) sz = 1; if (sz > 5) sz = 5;
+    spr.setFont(&fonts::lgfxJapanGothic_40);
+    spr.setTextSize(sz);
+    spr.setTextColor(mix888(wc, C_BG, (uint8_t)(g_ovOp * 255 / 100)));
+    spr.drawString(o.word, HERO_W / 2, 196);
+    spr.setTextSize(1);
+  }
+  // bottom band = target opening + time-of-day
+  if (o.bot[0]) {
+    int by = HERO_H - 92 - bh;
+    spr.fillRect(6, by, HERO_W - 12, bh, mix888(wc, C_BG, 80));
+    spr.drawRect(6, by, HERO_W - 12, bh, wc);
+    spr.setFont(&fonts::lgfxJapanGothic_20);
+    spr.setTextColor(C_TEXT);
+    spr.drawString(o.bot, HERO_W / 2, by + bh / 2);
+  }
+}
+
 // ---- hero: room-temp ring ---------------------------------------------------
 static void drawHero() {
   float t = HS[g_house].temp;
@@ -266,6 +391,7 @@ static void drawHero() {
   sprHero.setFont(&fonts::lgfxJapanGothic_28);
   sprHero.setTextColor(sevMain());
   sprHero.drawString(sevWord(), 20, HERO_H - 50);
+  drawOverlayInto(sprHero);
   sprHero.pushSprite(HERO_X, HERO_Y);
 }
 
@@ -412,11 +538,36 @@ static bool ends(const char* topic, const char* suffix) {
   size_t lt = strlen(topic), ls = strlen(suffix);
   return lt >= ls && strcmp(topic + lt - ls, suffix) == 0;
 }
+// agriha/{house}/window/reason/{winid}: ArSprout STD_ATMP status, split per side.
+static void handleReason(HouseData& h, JsonDocument& doc) {
+  const char* side = doc["side"] | "";
+  int idx = !strcmp(side, "west") ? 1 : 0;         // east (and unknown) -> 0, west -> 1
+  int tgt = doc["target_pct"] | 0;
+  if (h.rTgt[idx] >= 0 && tgt != h.rTgt[idx]) {     // a real target move -> linger the open/close word
+    h.rMotDir[idx] = tgt > h.rTgt[idx] ? 1 : -1;
+    h.rMotMs[idx]  = millis();
+  }
+  h.rTgt[idx] = tgt;
+  strlcpy(h.rCons[idx], doc["constraint"] | "none", sizeof(h.rCons[idx]));
+  h.rCnd[idx] = doc["cnd_no"] | -1;
+  JsonObject al = doc["alert"];
+  h.rAlert[idx] = !al.isNull();
+  if (h.rAlert[idx]) {                               // build a readable condition (raw for now, §4)
+    JsonObject ev = al["eval"];
+    const char* rid = ev["RuleEvalId-1"] | "";
+    const char* rv  = ev["RuleEvalValue-1"] | "";
+    if (!strcmp(rid, "2") && rv[0]) snprintf(h.rAlertTxt[idx], sizeof(h.rAlertTxt[idx]), "相対湿度 %s%%以上", rv);
+    else if (rv[0])                 snprintf(h.rAlertTxt[idx], sizeof(h.rAlertTxt[idx]), "#%d 値%s", al["alert_id"] | 0, rv);
+    else                            snprintf(h.rAlertTxt[idx], sizeof(h.rAlertTxt[idx]), "#%d", al["alert_id"] | 0);
+  } else h.rAlertTxt[idx][0] = 0;
+  h.rTs[idx] = millis();
+}
+
 static void onMqtt(char* topic, byte* payload, unsigned int len) {
   if (strncmp(topic, "agriha/", 7) != 0) return;
   int house = atoi(topic + 7);                     // "agriha/2/..." -> 2 (farm -> 0)
   if (house < 0 || house >= HMAX) return;
-  StaticJsonDocument<384> doc;
+  StaticJsonDocument<512> doc;
   if (deserializeJson(doc, payload, len)) return;
   HouseData& h = HS[house];
   bool cur = (house == g_house);
@@ -429,6 +580,7 @@ static void onMqtt(char* topic, byte* payload, unsigned int len) {
   else if (ends(topic, "/sensor/Flow"))          { h.flow  = doc["flow_lpm"]  | (doc["value"] | NAN); if (cur) dFlow = true; }
   else if (ends(topic, "/window/1")) { h.w1p = doc["pct"] | 0; h.w1t = doc["target"] | 0; strlcpy(h.w1s, doc["src"] | "-", sizeof(h.w1s)); if (cur) dW1 = true; }
   else if (ends(topic, "/window/2")) { h.w2p = doc["pct"] | 0; h.w2t = doc["target"] | 0; strlcpy(h.w2s, doc["src"] | "-", sizeof(h.w2s)); if (cur) dW2 = true; }
+  else if (strstr(topic, "/window/reason/")) { handleReason(h, doc); if (cur) dTemp = true; }
 }
 
 static void mqttConnect() {
@@ -532,9 +684,18 @@ static void loadConfig() {
   TH_ALERT   = prefs.getFloat("tha", 30.0f);
   TH_DANGER  = prefs.getFloat("thd", 31.0f);
   TEMP_SP    = prefs.getFloat("sp", 28.0f);
+  g_ovOn     = prefs.getInt("ovon", 1) != 0;
+  g_ovOp     = prefs.getInt("ovop", 45);
+  g_ovBh     = prefs.getInt("ovbh", 44);
+  g_ovFs     = prefs.getInt("ovfs", 168);
+  g_ovSec    = prefs.getInt("ovsec", 45);
   prefs.end();
   if (g_skin < 0 || g_skin > 2) g_skin = 0;
   if (g_rotSecs < 3) g_rotSecs = 3;
+  if (g_ovOp < 10)  g_ovOp = 10;   if (g_ovOp > 100) g_ovOp = 100;
+  if (g_ovBh < 16)  g_ovBh = 16;   if (g_ovBh > 90)  g_ovBh = 90;
+  if (g_ovFs < 40)  g_ovFs = 40;   if (g_ovFs > 200) g_ovFs = 200;
+  if (g_ovSec < 5)  g_ovSec = 5;   if (g_ovSec > 600) g_ovSec = 600;
   parseHouses();
 }
 static void saveConfig() {
@@ -544,12 +705,15 @@ static void saveConfig() {
   prefs.putInt("rotsec", g_rotSecs);
   prefs.putFloat("thc", TH_CAUTION); prefs.putFloat("tha", TH_ALERT);
   prefs.putFloat("thd", TH_DANGER);  prefs.putFloat("sp", TEMP_SP);
+  prefs.putInt("ovon", g_ovOn ? 1 : 0);
+  prefs.putInt("ovop", g_ovOp); prefs.putInt("ovbh", g_ovBh);
+  prefs.putInt("ovfs", g_ovFs); prefs.putInt("ovsec", g_ovSec);
   prefs.end();
 }
 
 // ---- WebUI ------------------------------------------------------------------
 static String htmlPage() {
-  String s; s.reserve(3600); char b[128];
+  String s; s.reserve(4400); char b[128];
   s += F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>agri-display</title><style>"
     "body{background:#0d0a07;color:#f3e7d3;font-family:system-ui,sans-serif;margin:0;padding:20px;max-width:640px}"
@@ -581,7 +745,14 @@ static String htmlPage() {
   s += F("</div><div class=row>");
   snprintf(b,sizeof(b),"<div><label>警告</label><input name=tha value=%.1f></div>",TH_ALERT); s+=b;
   snprintf(b,sizeof(b),"<div><label>危険</label><input name=thd value=%.1f></div>",TH_DANGER); s+=b;
-  s += F("</div><button type=submit>保存</button></form>");
+  s += F("</div><h2>窓の警告帯</h2><label><input type=checkbox name=ovon value=1");
+  if (g_ovOn) s += F(" checked");
+  s += F("> 表示する</label>");
+  snprintf(b,sizeof(b),"<label>文字の濃さ %%（薄 10 - 濃 100）</label><input name=ovop type=number min=10 max=100 value=%d>",g_ovOp); s+=b;
+  snprintf(b,sizeof(b),"<label>帯の太さ px（16-90）</label><input name=ovbh type=number min=16 max=90 value=%d>",g_ovBh); s+=b;
+  snprintf(b,sizeof(b),"<label>文字サイズ px（40-200）</label><input name=ovfs type=number min=40 max=200 value=%d>",g_ovFs); s+=b;
+  snprintf(b,sizeof(b),"<label>通常の開閉を出す長さ 秒（5-600）</label><input name=ovsec type=number min=5 max=600 value=%d>",g_ovSec); s+=b;
+  s += F("<button type=submit>保存</button></form>");
   // GitHub self-update banner (shown only when a newer release exists / is in flight)
   if (g_otaAvail || g_otaState != OTA_IDLE) {
     s += F("<h2>自動更新 (GitHub)</h2>");
@@ -626,8 +797,17 @@ static void handleSave() {
   if (server.hasArg("thc"))    TH_CAUTION = server.arg("thc").toFloat();
   if (server.hasArg("tha"))    TH_ALERT   = server.arg("tha").toFloat();
   if (server.hasArg("thd"))    TH_DANGER  = server.arg("thd").toFloat();
+  g_ovOn = server.hasArg("ovon");                 // unchecked checkbox => arg absent
+  if (server.hasArg("ovop"))   g_ovOp  = server.arg("ovop").toInt();
+  if (server.hasArg("ovbh"))   g_ovBh  = server.arg("ovbh").toInt();
+  if (server.hasArg("ovfs"))   g_ovFs  = server.arg("ovfs").toInt();
+  if (server.hasArg("ovsec"))  g_ovSec = server.arg("ovsec").toInt();
   if (g_skin < 0 || g_skin > 2) g_skin = 0;
   if (g_rotSecs < 3) g_rotSecs = 3;
+  if (g_ovOp < 10)  g_ovOp = 10;   if (g_ovOp > 100) g_ovOp = 100;
+  if (g_ovBh < 16)  g_ovBh = 16;   if (g_ovBh > 90)  g_ovBh = 90;
+  if (g_ovFs < 40)  g_ovFs = 40;   if (g_ovFs > 200) g_ovFs = 200;
+  if (g_ovSec < 5)  g_ovSec = 5;   if (g_ovSec > 600) g_ovSec = 600;
   g_rotIdx = 0;
   parseHouses();
   saveConfig();
@@ -721,7 +901,13 @@ void loop() {
   static uint32_t lastReconnect = 0, lastDraw = 0, lastSample = 0, lastBeat = 0, lastRot = 0;
   server.handleClient();
   otaPoll();                 // daily re-check + flash when a /api/update click set PENDING
-  if (millis() - lastBeat > 500) { lastBeat = millis(); g_beat = !g_beat; drawHeartbeat(); }
+  static bool ovWas = false;
+  if (millis() - lastBeat > 500) {
+    lastBeat = millis(); g_beat = !g_beat; drawHeartbeat();
+    bool ovNow = g_ovOn && computeOverlay(g_house, millis()).active;
+    if (ovNow || ovWas) dTemp = true;    // blink, linger expiry, and the clear-edge
+    ovWas = ovNow;
+  }
 
   if (!mqtt.connected()) {
     if (millis() - lastReconnect > 3000) { lastReconnect = millis(); mqttConnect(); }
